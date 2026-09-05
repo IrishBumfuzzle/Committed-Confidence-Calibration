@@ -1,0 +1,34 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+
+# Run outputs: large, regenerable, or machine-specific.
+runs/
+logs/
+
+# Anchored to the repo root. An unanchored "data/" also matches c3/data/, which
+# silently kept the corpus-sampling module out of the repository and left three
+# scripts unrunnable from a fresh clone.
+/data/
+
+# Large binaries. Small scientific artefacts under artifacts/ are tracked
+# deliberately -- see artifacts/README.md.
+*.bin
+*.pt
+.gitattributes
+
+# LaTeX build intermediates (main.pdf and slides.pdf are committed on purpose)
+paper/main.aux
+paper/main.bbl
+paper/main.blg
+paper/main.log
+paper/main.out
+slides/slides.aux
+slides/slides.log
+slides/slides.nav
+slides/slides.out
+slides/slides.snm
+slides/slides.toc
+dist/
