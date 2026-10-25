@@ -1,0 +1,12 @@
+# sha256 of the off-repo inputs of scripts/jarvis_t12.sh.
+# Paths are relative to the repository root.  `check`, `calibrate` and `run` refuse on a missing
+# file or a mismatch.  The split manifests are the frozen prereg-v1 hashes of the LF blobs
+# (`git show HEAD:<path> | sha256sum`): a CRLF checkout (the Windows laptop) hashes differently,
+# so the code must reach the VM through git, never as a copied working tree.
+b6d65073f57ebb3df0675469b2120b68eba14281ca811e59efdf40ac004603f6  artifacts/split_manifest_gsm8k.json
+74e68dd64d5f24d509d93e90e13fd83969ae31a6be233115d48387211ae0001d  artifacts/split_manifest_mbpp.json
+13311d950537c1fb2245f9dbc3f4f11f44b349c2eabf70ce9f0d1fbe2c352b24  artifacts/c3/llada-8b-instruct_fp16_c3a-gsm8k.json
+f748e597e4b2b202934249507c0f5a1e9a97f852e823d1599a9865ca9c1940e9  artifacts/c3/llada-8b-instruct_fp16_c3a-mbpp.json
+1ae28fab52f09a06380c0049b286d1acb5173b3282fa96cb3fefd9a74ce39628  runs/corpus/reserve_docs.jsonl
+b183e93afd8839f1a591c3dc68c063f99d7c2cc816ae5416b5cc6c47efaa807e  runs/corpus/tasks/gsm8k_test.jsonl
+5ae0bb957231ad7887ed69b6cb6094220dc25214c63a84f0ec21ed18122037dc  runs/corpus/tasks/mbpp_test.jsonl
