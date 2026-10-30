@@ -1,0 +1,1799 @@
+"""scripts/c3_paper_outputs.py on a synthetic T12 fixture.
+
+The report-half results do not exist yet: these tests build records, verdicts, grids and
+calibrator metadata in the formats ``scripts/run_t12.py``, ``scripts/score_t12.py``,
+``scripts/pick_knobs.py`` and ``scripts/fit_c3a_calibrator.py`` write, with numbers chosen so
+every expected value can be computed by hand.  A schema and arithmetic check, not results.
+"""
+import csv
+import json
+import math
+import re
+import sys
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+
+import c3_paper_outputs as P  # noqa: E402
+
+TASKS = ("gsm8k", "mbpp")
+TASK_WORD = {"gsm8k": "Gsm", "mbpp": "Mbpp"}
+DEC_POLICY = {"TopK": "topk_conf", "Threshold": "threshold", "Margin": "margin",
+              "Entropy": "entropy_bounded", "Klass": "klass", "PcSampler": "pc_sampler",
+              "CThreeA": "c3a"}
+SPEED_WORD = {1: "SpeedOne", 2: "SpeedTwo", 3: "SpeedThree"}
+N_DOCS = 30
+# forward passes per problem (before the +-1 wobble that keeps the sum fixed): tokens per
+# step of the configuration is 256 / NFE0.
+NFE0 = {
+    "TopK": (128, 64, 32), "Margin": (128, 64, 32), "PcSampler": (128, 64, 32),
+    "CThreeA": (128, 64, 32),
+    # slot 1 is the nearest to C3a's speed-2 (4.063), not slot 2 (3.657)
+    "Threshold": (63, 70, 30),
+    # never within 10% of C3a at any slot
+    "Entropy": (100, 80, 20),
+    # exactly C3a's speed at slot 3, but flagged unmatched at the target
+    "Klass": (130, 64, 32),
+}
+ALPHA = {"gsm8k": (0.022, 0.271, 0.638), "mbpp": (0.039, 0.322, 0.735)}
+KNOBS = {
+    "TopK": lambda s, t: {"k": (2, 4, 8)[s - 1]},
+    "Margin": lambda s, t: {"k": (2, 4, 8)[s - 1]},
+    "PcSampler": lambda s, t: {"k": (2, 4, 8)[s - 1], "lam": 0.25, "alpha": 10.0},
+    "Threshold": lambda s, t: {"tau": (0.99, 0.86, 0.49)[s - 1]},
+    "Entropy": lambda s, t: {"gamma": (0.017, 0.5, 6.1)[s - 1]},
+    "Klass": lambda s, t: {"tau": (0.8, 0.29, 0.2)[s - 1], "eps_kl": 0.01, "history": 2,
+                           "fallback": 1},
+    "CThreeA": lambda s, t: {"alpha": ALPHA[t][s - 1]},
+}
+
+
+def config_key(cfg):
+    knobs = ",".join(f"{k}={cfg[k]}" for k in sorted(cfg) if k != "policy")
+    return f"{cfg['policy']}[{knobs}]"
+
+
+def cfg_of(dec, slot, task):
+    return {"policy": DEC_POLICY[dec], **KNOBS[dec](slot, task)}
+
+
+def nfe_of(dec, slot, i):
+    return NFE0[dec][slot - 1] + (i % 3 - 1)          # +-1: the sum over 30 docs is exact
+
+
+def correct_of(task, dec, slot, i):
+    if dec == "CThreeA":
+        return i % 5 != 0 if slot != 3 else i % 3 != 0
+    if dec in ("TopK", "Margin"):
+        return i % 5 != 0 and i % 7 != 0
+    return i % 5 != 0 and i % 11 != 0
+
+
+def outside_of(task, i):
+    return i % 2 == 0 if task == "gsm8k" else i % 3 == 0
+
+
+def failed(task, dec, slot, i):
+    return task == "mbpp" and dec == "TopK" and slot == 3 and i == 4
+
+
+def make_grid(task):
+    configs, picks, speed_of = [], [], {}
+    for dec in DEC_POLICY:
+        for s in (1, 2, 3):
+            cfg = cfg_of(dec, s, task)
+            configs.append(cfg)
+            speed_of[config_key(cfg)] = s
+            if dec in ("Threshold", "Entropy", "Klass", "CThreeA"):
+                picks.append({"policy": cfg["policy"], "speed": s, "target_tokens_per_step": 2.0 * 2 ** (s - 1),
+                              "config_key": config_key(cfg),
+                              "knobs": {k: v for k, v in cfg.items() if k != "policy"},
+                              "unmatched_at_target": dec == "Klass" and s == 3,
+                              "achieved_tokens_per_step": None, "bracket": [1.0, 9.0]})
+    return {"task": task, "status": "calibrated", "targets": {"speed1": 2.0, "speed2": 4.0, "speed3": 8.0},
+            "configs": configs, "speed_of_config": speed_of, "picks": picks}
+
+
+def write_jsonl(path, rows):
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+
+
+JUNK_DOC = 1000                                      # a fit-half doc_id in the fixture manifests
+
+
+def meta_of(task, shard, nshards=2, n_docs=N_DOCS, **over):
+    """The meta file ``run_t12.py`` writes for one shard (the fields score_t12.RUN_FIELDS and
+    the completeness checks read)."""
+    m = {"task": task, "half": "report", "gen_length": 256, "run_id": f"run{shard}", "precision": "fp16",
+         "model": "llada-8b-instruct", "model_revision": "rev1", "task_jsonl_sha256": "t" * 8,
+         "manifest_sha256": "m" * 8, "configs_sha256": "c" * 8, "calibrator_sha256": "k" * 8,
+         "c3a_clamp": False, "pc_sampler_variant": "full", "decoding": "greedy", "block_length": 32,
+         "prompt": {"format": "chat", "fewshot": 0}, "limit": 0, "shard": shard, "num_shards": nshards,
+         "label": "jl-report", "provenance": {"host": "jarvis-1", "gpu": "RTX PRO 6000", "git_commit": "abc1234"},
+         "doc_ids": [i for i in range(n_docs) if i % nshards == shard]}
+    m.update(over)
+    return m
+
+
+def make_fixture(root: Path, with_records=True, with_verdicts=True, with_grids=True,
+                 with_cal=True, with_sanity=True, with_manifests=True, nshards=2, n_docs=N_DOCS):
+    """Write every input under ``root``; returns the paths."""
+    paths = {"records": root / "runs", "verdicts": root / "verdicts.jsonl", "grids": root / "grids",
+             "cal": root / "cal", "sanity": root / "sanity.json", "out": root / "out",
+             "manifests": root / "manifests", "risk": root / "realised_risk.json"}
+    verdicts = []
+    for task in TASKS:
+        shard_rows = {sh: [] for sh in range(nshards)}
+        for i in range(n_docs):
+            for dec in DEC_POLICY:
+                for s in (1, 2, 3):
+                    cfg = cfg_of(dec, s, task)
+                    key = config_key(cfg)
+                    rec = {"config": key, **cfg, "task": task, "doc_id": i, "run_id": f"run{i % nshards}",
+                           "precision": "fp16", "git_commit": "abc1234"}
+                    if failed(task, dec, s, i):
+                        rec.update({"completion": None, "error": "OutOfMemoryError: out of memory"})
+                    else:
+                        nfe = nfe_of(dec, s, i)
+                        rec.update({"completion": "x", "stopped": True, "n_forward": nfe,
+                                    "n_committed": 256, "tokens_per_step": 256 / nfe,
+                                    "seconds": 1.0 + 0.01 * NFE0[dec][s - 1], "error": None})
+                    if dec == "CThreeA":
+                        rec["c3a_steps"] = [{"step": st, "n_commit": 3, "n_eligible": 5,
+                                             "median_ell": 0.1, "mask_rate": 0.5, "log_n_masked": 3.0,
+                                             "outside": ["mask_rate"] if (st == 0 and outside_of(task, i)) else []}
+                                            for st in range(10)]
+                    shard_rows[i % nshards].append(rec)
+                    ok = (not failed(task, dec, s, i)) and correct_of(task, dec, s, i)
+                    verdicts.append({"run": P.run_key(meta_of(task, i % nshards, nshards, n_docs)), "run_id": f"run{i % nshards}", "prompt_format": "chat",
+                                     "task": task, "config": key, "doc_id": i, "stopped": True,
+                                     "correct": bool(ok), "extracted": None, "driver_error": failed(task, dec, s, i),
+                                     "error": None})
+        if with_records:
+            d = paths["records"] / f"sweep-{task}"
+            d.mkdir(parents=True, exist_ok=True)
+            for sh, rows in shard_rows.items():
+                write_jsonl(d / f"t12.shard{sh}of{nshards}.jsonl", rows)
+                (d / f"t12.shard{sh}of{nshards}.meta.json").write_text(json.dumps(meta_of(task, sh, nshards, n_docs)))
+        if with_manifests:
+            paths["manifests"].mkdir(exist_ok=True)
+            man = {str(i): 1 for i in range(n_docs)} | {str(JUNK_DOC + i): 0 for i in range(10)}
+            (paths["manifests"] / f"split_manifest_{task}.json").write_text(json.dumps(man))
+        if with_grids:
+            paths["grids"].mkdir(exist_ok=True)
+            (paths["grids"] / f"t12_grid_{task}.json").write_text(json.dumps(make_grid(task)))
+        if with_cal:
+            paths["cal"].mkdir(exist_ok=True)
+            (paths["cal"] / f"llada-8b-instruct_fp16_c3a-{task}.json").write_text(json.dumps({
+                "n_fit_docs": 660 if task == "gsm8k" else 255, "monotone_share": 1.0 if task == "gsm8k" else 0.9876,
+                "dev_check": {"ece": {"raw": {"value": 0.0607, "ci": [0.05, 0.07]},
+                                      "calibrated": {"value": 0.0059, "ci": [0.003, 0.01]}}},
+                "provenance": {"git_commit": "0b5c8b8"}}))
+    # c3_realised_risk.py's JSON (report half, teacher-forced): only tasks.<task>.ece is read.  The pooled
+    # value differs from k4's so that reading the wrong arm shows.
+    def ece(v, lo, hi):
+        return {"ece": v, "ci_low": lo, "ci_high": hi, "bins": []}
+    arm = {"gsm8k": {"k4": (0.0603, 0.0557, 0.0651, 0.00379, 0.00272, 0.00756),
+                     "pooled": (0.0605, 0.0561, 0.0652, 0.00390, 0.00276, 0.00737)},
+           "mbpp": {"k4": (0.0402, 0.0340, 0.0474, 0.00543, 0.00461, 0.01109),
+                    "pooled": (0.0418, 0.0365, 0.0477, 0.00474, 0.00382, 0.00941)}}
+    paths["risk"].write_text(json.dumps({
+        "half": "report", "status": "exploratory",
+        "tasks": {t: {"n_docs": 659 if t == "gsm8k" else 250,
+                      "ece": {a: {"raw_sigma_ell": ece(*v[:3]), "calibrated": ece(*v[3:])} for a, v in arms.items()}}
+                  for t, arms in arm.items()}}))
+    if with_verdicts:
+        write_jsonl(paths["verdicts"], verdicts)
+    # the Ada sanity run, score_t12.py output (n=200)
+    if with_sanity:
+        paths["sanity"].write_text(json.dumps({
+            "created": "2026-10-25T18:55:24+00:00", "inputs": [], "warnings": [],
+            "provenance": {"git_commit": "0b5c8b8", "git_dirty": False},
+            "rows": [{"task": "gsm8k", "config": "threshold[tau=0.9]", "prompt_format": "lmeval", "half": "fit",
+                      "n": 200, "n_correct": 169, "accuracy": 0.845, "ci95": [0.7884, 0.8886]},
+                     {"task": "gsm8k", "config": "topk_conf[k=1]", "prompt_format": "lmeval", "half": "fit",
+                      "n": 200, "n_correct": 167, "accuracy": 0.835, "ci95": [0.7773, 0.8800]}]}))
+    return paths
+
+
+def run_main(paths, *extra, records=True, verdicts=True, grids=True, cal=True, sanity=True, manifests=True,
+             risk=True):
+    argv = ["--out-dir", str(paths["out"])]
+    if risk:
+        argv += ["--realised-risk", str(paths["risk"])]
+    if records:
+        argv += ["--records", str(paths["records"])]
+    if verdicts:
+        argv += ["--verdicts", str(paths["verdicts"])]
+    nope = str(paths["out"].parent / "does-not-exist")   # an omitted flag would use the repo defaults
+    argv += ["--grids", str(paths["grids"]) if grids else nope]
+    argv += ["--calibrators", str(paths["cal"]) if cal else nope]
+    argv += ["--sanity", str(paths["sanity"]) if sanity else nope]
+    argv += ["--manifest-dir", str(paths["manifests"]) if manifests else nope]
+    return P.main(argv + list(extra))
+
+
+@pytest.fixture(scope="module")
+def built(tmp_path_factory):
+    root = tmp_path_factory.mktemp("c3paper")
+    paths = make_fixture(root)
+    assert run_main(paths) == 0
+    out = paths["out"]
+    return {"paths": paths, "out": out,
+            "summary": json.loads((out / "t12" / "llada-8b-instruct_fp16_t12-summary.json").read_text()),
+            "macros": parse_macros((out / "c3" / "macros_c3.tex").read_text())}
+
+
+NEWCOMMAND = re.compile(r"^\\newcommand\{\\([A-Za-z]+)\}\{(.*)\}$")
+
+
+def parse_macros(text):
+    out = {}
+    for line in text.splitlines():
+        if not line.strip() or line.startswith("%"):
+            continue
+        m = NEWCOMMAND.match(line)
+        assert m, f"not a \\newcommand line: {line!r}"
+        assert m.group(1) not in out, f"{m.group(1)} defined twice"
+        out[m.group(1)] = m.group(2)
+    return out
+
+
+def val(body):
+    """The number in a macro body (the sign may be \\ensuremath{-})."""
+    body = body.replace("\\ensuremath{-}", "-")
+    return float(body)
+
+
+# ------------------------------------------------------------------ pure functions
+def test_aggregate_speed_is_not_the_mean_of_ratios():
+    nfe = [10, 20, 40]                       # ratios 25.6, 12.8, 6.4
+    assert P.aggregate_speed(nfe) == pytest.approx(256 * 3 / 70)
+    assert P.aggregate_speed(nfe) != pytest.approx(np.mean([256 / n for n in nfe]))
+    assert P.aggregate_speed(nfe, gen_length=128) == pytest.approx(128 * 3 / 70)
+    assert math.isnan(P.aggregate_speed([]))
+
+
+def test_aggregate_speed_in_summary_matches_hand_calculation(built):
+    gsm = built["summary"]["tasks"]["gsm8k"]["decoders"]["TopK"]["speeds"]
+    # NFE per doc = 64 + (i % 3 - 1) over 30 docs: the sum is 30 * 64
+    assert gsm["2"]["tps"] == pytest.approx(256 * 30 / (30 * 64))
+    assert gsm["2"]["nfe"] == pytest.approx(64.0)
+    assert gsm["2"]["seconds"] == pytest.approx(1.0 + 0.64)
+    # the mean of per-problem ratios is larger (Jensen) and is recorded separately
+    assert gsm["2"]["mean_of_ratios"] > gsm["2"]["tps"]
+    thr = built["summary"]["tasks"]["gsm8k"]["decoders"]["Threshold"]["speeds"]
+    assert thr["1"]["tps"] == pytest.approx(256 / 63)
+
+
+def test_failed_records_are_counted_and_leave_the_speed_alone(built):
+    sp = built["summary"]["tasks"]["mbpp"]["decoders"]["TopK"]["speeds"]["3"]
+    assert sp["failures"] == 1 and sp["n"] == N_DOCS and sp["n_ok"] == N_DOCS - 1
+    nfes = [nfe_of("TopK", 3, i) for i in range(N_DOCS) if i != 4]
+    assert sp["tps"] == pytest.approx(256 * len(nfes) / sum(nfes))
+    # a failed problem scores wrong: its verdict is 0
+    assert sp["n_correct"] == sum(correct_of("mbpp", "TopK", 3, i) for i in range(N_DOCS) if i != 4)
+    assert built["summary"]["tasks"]["gsm8k"]["decoders"]["TopK"]["speeds"]["3"]["failures"] == 0
+
+
+SETTINGS = {1: {"tps": 4.063, "unmatched": False}, 2: {"tps": 3.657, "unmatched": False},
+            3: {"tps": 8.533, "unmatched": False}}
+
+
+def test_match_picks_nearest_setting_not_the_same_slot():
+    m = P.match_baseline(2, 4.0, SETTINGS)
+    assert m["slot"] == 1 and m["tps"] == pytest.approx(4.063)
+    assert P.match_baseline(3, 8.0, SETTINGS)["slot"] == 3
+
+
+def test_match_requires_within_ten_percent():
+    assert P.match_baseline(1, 2.0, SETTINGS) is None            # nearest is 3.657
+    just_in = {1: {"tps": 4.4, "unmatched": False}}               # exactly +10%
+    just_out = {1: {"tps": 4.41, "unmatched": False}}
+    assert P.match_baseline(2, 4.0, just_in)["slot"] == 1
+    assert P.match_baseline(2, 4.0, just_out) is None
+    assert P.match_baseline(2, 4.0, {1: {"tps": 3.6, "unmatched": False}})["slot"] == 1   # -10%
+    assert P.match_baseline(2, 4.0, {}) is None
+    assert P.match_baseline(2, float("nan"), SETTINGS) is None
+
+
+def test_match_is_dashed_where_the_grid_says_unmatched_at_target():
+    klass = {1: {"tps": 2.0, "unmatched": False}, 2: {"tps": 4.0, "unmatched": False},
+             3: {"tps": 8.0, "unmatched": True}}              # numerically exactly C3a's speed
+    assert P.match_baseline(2, 4.0, klass)["slot"] == 2
+    assert P.match_baseline(3, 8.0, klass) is None
+
+
+def test_bootstrap_known_numbers():
+    """Pinned values (numpy default_rng, seed 20261030, 2,000 resamples), not a re-implementation."""
+    assert P.SEED == 20261030 and P.N_BOOT == 2000
+    # d = [1, 0, -1, 1, 0, 0]: mean 1/6; resampled means are multiples of 1/6
+    a = {0: 1, 1: 1, 2: 0, 3: 1, 4: 1, 5: 0}
+    b = {0: 0, 1: 1, 2: 1, 3: 0, 4: 1, 5: 0}
+    r = P.paired_bootstrap(a, b)
+    assert r["n"] == 6
+    assert (r["diff"], r["lo"], r["hi"]) == pytest.approx((1 / 6, -1 / 3, 2 / 3), abs=1e-12)
+    # every problem favours a: a zero-width interval at 1
+    r = P.paired_bootstrap({0: 1, 1: 1, 2: 1, 3: 1}, {0: 0, 1: 0, 2: 0, 3: 0})
+    assert (r["diff"], r["lo"], r["hi"], r["n"]) == (1.0, 1.0, 1.0, 4)
+    a = {i: int(i % 4 != 0) for i in range(40)}
+    b = {i: int(i % 3 != 0) for i in range(40)}
+    r = P.paired_bootstrap(a, b)
+    assert (r["diff"], r["lo"], r["hi"]) == pytest.approx((0.1, -0.075625, 0.3), abs=1e-12)
+    assert r == P.paired_bootstrap(a, b)                        # deterministic
+    assert P.paired_bootstrap(a, b, seed=1)["lo"] == pytest.approx(-0.1, abs=1e-12)
+
+
+def test_bootstrap_is_paired_on_shared_doc_ids_and_ignores_order():
+    a = {i: int(i % 4 != 0) for i in range(40)}
+    b = {i: int(i % 3 != 0) for i in range(40)}
+    full = P.paired_bootstrap(a, b)
+    # docs only one side has are dropped; dict insertion order does not matter
+    a_extra = {**{i: a[i] for i in reversed(range(40))}, 100: 1, 101: 0}
+    b_extra = {**b, 200: 1}
+    assert P.paired_bootstrap(a_extra, b_extra) == full
+    # paired: if a == b on every doc the difference is exactly 0 with a zero-width interval,
+    # which an unpaired bootstrap of two copies of the same sample would not give
+    same = P.paired_bootstrap(a, dict(a))
+    assert (same["diff"], same["lo"], same["hi"]) == (0.0, 0.0, 0.0)
+    assert P.paired_bootstrap({1: 1}, {2: 0})["n"] == 0
+    assert math.isnan(P.paired_bootstrap({1: 1}, {2: 0})["diff"])
+
+
+def test_wilson_matches_score_t12():
+    lo, hi = P.wilson(167, 200)
+    assert (lo, hi) == pytest.approx((0.7773, 0.8800), abs=1e-4)
+
+
+# ------------------------------------------------------------------ the fixture run
+def test_matched_differences_in_summary(built):
+    t = built["summary"]["tasks"]["gsm8k"]
+    m = t["matched"]["2"]
+    # C3a at speed 2 is correct for i % 5 != 0 (24/30); top-k for neither i % 5 == 0 nor
+    # i % 7 == 0 (20/30); the C3a-better docs are 7, 14, 21, 28
+    assert m["TopK"]["matched"] is True and m["TopK"]["slot"] == 2
+    assert m["TopK"]["diff"] == pytest.approx(4 / 30)
+    assert m["TopK"]["lo"] <= 4 / 30 <= m["TopK"]["hi"] and m["TopK"]["n_paired"] == 30
+    assert m["Margin"]["diff"] == pytest.approx(4 / 30)
+    # threshold: slot 1 (4.063) is nearer to 4.0 than its own slot 2 (3.657)
+    assert m["Threshold"]["slot"] == 1
+    # entropy is never within 10%
+    for s in "123":
+        assert t["matched"][s]["Entropy"]["matched"] is False
+    assert "CThreeA" not in m
+
+
+def test_klass_unmatched_at_target_gives_dash_even_at_equal_speed(built):
+    t = built["summary"]["tasks"]["gsm8k"]
+    assert t["matched"]["3"]["Klass"]["matched"] is False
+    assert t["matched"]["3"]["Klass"]["reason"] == "unmatched_at_target"
+    assert t["matched"]["2"]["Klass"]["matched"] is True
+    assert built["macros"]["CThreeTTwelveGsmMatchedDiffKlassSpeedThree"] == DASH_MACRO
+    assert built["macros"]["CThreeTTwelveGsmMatchedDiffKlassSpeedThreeLo"] == DASH_MACRO
+    # KLASS's own speed-3 setting is still reported
+    assert "CThreeTTwelveGsmKlassSpeedThreeAcc" in built["macros"]
+
+
+def test_accuracy_wilson_and_n(built):
+    s = built["summary"]["tasks"]["gsm8k"]["decoders"]["CThreeA"]["speeds"]["2"]
+    assert s["n_correct"] == 24 and s["acc"] == pytest.approx(0.8)
+    assert s["ci95"] == pytest.approx(list(P.wilson(24, 30)))
+    assert built["macros"]["CThreeTTwelveGsmN"] == "30"
+    assert built["macros"]["CThreeTTwelveGsmCThreeASpeedTwoAcc"] == "0.800"
+    assert built["macros"]["CThreeTTwelveGsmCThreeASpeedTwoAccLo"] == f"{P.wilson(24, 30)[0]:.3f}"
+    assert built["macros"]["CThreeTTwelveGsmCThreeASpeedTwoTPS"] == "4.00"
+
+
+def test_outside_share_from_c3a_step_logs(built):
+    # gsm8k: docs 0,2,..28 (15 of 30) have one outside step of 10; mbpp: docs i % 3 == 0 (10)
+    assert built["macros"]["CThreeTTwelveGsmOutsideShare"] == "0.050"
+    assert built["macros"]["CThreeTTwelveMbppOutsideShare"] == "0.033"
+    assert built["summary"]["tasks"]["gsm8k"]["outside_share"]["n_steps"] == 3 * 300
+
+
+def test_alpha_macros_and_primary_alias(built):
+    mac = built["macros"]
+    assert mac["CThreeTTwelveGsmCThreeASpeedOneAlpha"] == "0.022"
+    assert mac["CThreeTTwelveMbppCThreeASpeedThreeAlpha"] == "0.735"
+    assert mac["CThreeTTwelveGsmAlphaPrimary"] == mac["CThreeTTwelveGsmCThreeASpeedTwoAlpha"] == "0.271"
+    assert mac["CThreeTTwelveMbppAlphaPrimary"] == "0.322"
+
+
+def test_t11_macros(built):
+    mac = built["macros"]
+    assert mac["CThreeTElevenGsmFitDocs"] == "660"
+    assert mac["CThreeTElevenMbppFitDocs"] == "255"
+    assert mac["CThreeTElevenMbppMonotoneShare"] == "0.988"
+    assert mac["CThreeTElevenGsmDevECERaw"] == "0.061"
+    assert mac["CThreeTElevenGsmDevECECal"] == "0.006"
+
+
+def test_report_half_ece_macros_come_from_the_realised_risk_json_arm_k4(built):
+    mac = built["macros"]
+    assert mac["CThreeTElevenGsmReportECERaw"] == "0.060" and mac["CThreeTElevenGsmReportECECal"] == "0.004"
+    assert mac["CThreeTElevenMbppReportECERaw"] == "0.040" and mac["CThreeTElevenMbppReportECECal"] == "0.005"
+    assert (mac["CThreeTElevenGsmReportECERawLo"], mac["CThreeTElevenGsmReportECERawHi"]) == ("0.056", "0.065")
+    assert (mac["CThreeTElevenMbppReportECECalLo"], mac["CThreeTElevenMbppReportECECalHi"]) == ("0.005", "0.011")
+    s = built["summary"]["realised_risk"]
+    assert s["gsm8k"]["arm"] == "k4" and s["gsm8k"]["raw"]["value"] == pytest.approx(0.0603)
+    assert "realised_risk" in built["summary"]["inputs"]
+    # the held-out values are not the fit-half check's
+    assert mac["CThreeTElevenGsmReportECERaw"] != mac["CThreeTElevenGsmDevECERaw"]
+
+
+def test_no_realised_risk_input_leaves_the_report_ece_macros_undefined(tmp_path):
+    paths = make_fixture(tmp_path)
+    assert run_main(paths, risk=False) == 0
+    mac = parse_macros((paths["out"] / "c3" / "macros_c3.tex").read_text())
+    assert not [n for n in mac if "ReportECE" in n]
+    assert "CThreeTElevenGsmDevECERaw" in mac                       # the rest is unchanged
+    assert "realised-risk" not in summary_of(paths)["missing_inputs"]
+
+
+@pytest.mark.parametrize("break_it", ["missing", "fit_half", "bad_json"])
+def test_unusable_realised_risk_file_warns_and_is_not_a_crash(tmp_path, break_it):
+    paths = make_fixture(tmp_path)
+    if break_it == "missing":
+        paths["risk"].unlink()
+    elif break_it == "fit_half":
+        d = json.loads(paths["risk"].read_text())
+        d["half"] = "fit"
+        paths["risk"].write_text(json.dumps(d))
+    else:
+        paths["risk"].write_text("{not json")
+    assert run_main(paths) == 0
+    mac = parse_macros((paths["out"] / "c3" / "macros_c3.tex").read_text())
+    assert not [n for n in mac if "ReportECE" in n]
+    assert "realised-risk" in summary_of(paths)["missing_inputs"]
+
+
+def test_sanity_macros(built):
+    mac = built["macros"]
+    assert mac["CThreeTTwelveSanityN"] == "200"
+    assert mac["CThreeTTwelveSanityTopKAcc"] == "0.835"
+    assert mac["CThreeTTwelveSanityThresholdAcc"] == "0.845"
+    assert mac["CThreeTTwelveSanityTopKAccLo"] == "0.777"
+    assert mac["CThreeTTwelveSanityThresholdAccHi"] == "0.889"
+
+
+DASH_MACRO = r"\textnormal{---}"        # an em dash in text, never a minus inside the ensuremath of CresCI
+NUMBER = re.compile(r"^(\\ensuremath\{-\})?\d+(\.\d+)?$")
+
+
+def test_macros_are_wellformed_latex_with_three_decimals(built):
+    for name, body in built["macros"].items():
+        assert re.fullmatch(r"[A-Za-z]+", name)
+        assert name.startswith(("CThreeTEleven", "CThreeTTwelve"))
+        assert body == DASH_MACRO or NUMBER.match(body), (name, body)
+        assert body.count("{") == body.count("}")
+        three_dp = re.search(r"(Acc|AccLo|AccHi|MatchedDiff\w*|Share|Alpha|AlphaPrimary|DevECE\w+|ReportECE\w+)$", name)
+        if three_dp and body != DASH_MACRO:
+            assert re.search(r"\.\d{3,5}$", body), (name, body)
+        if name.endswith("N") or name.endswith("FitDocs"):
+            assert re.fullmatch(r"\d+", body), (name, body)
+    # no placeholders, no nan, and the name set carries no digit
+    assert not any("nan" in b.lower() or "inf" in b.lower() for b in built["macros"].values())
+
+
+def test_negative_difference_is_a_math_minus(built):
+    # C3a at speed 3 is correct for i % 3 != 0 (20/30), top-k at speed 3 for 20/30 too, but a
+    # different set: the sign of any difference must be \ensuremath{-} when negative
+    neg = [b for b in built["macros"].values() if b.startswith("\\ensuremath{-}")]
+    assert neg, "the fixture has at least one negative difference or interval end"
+    for b in neg:
+        assert NUMBER.match(b)
+
+
+def test_macro_value_of_matched_difference(built):
+    mac = built["macros"]
+    assert mac["CThreeTTwelveGsmMatchedDiffTopKSpeedTwo"] == "0.133"
+    lo, hi = val(mac["CThreeTTwelveGsmMatchedDiffTopKSpeedTwoLo"]), val(mac["CThreeTTwelveGsmMatchedDiffTopKSpeedTwoHi"])
+    assert lo <= 0.133 <= hi
+    assert mac["CThreeTTwelveGsmMatchedDiffEntropySpeedTwo"] == DASH_MACRO
+    assert not any(k.startswith("CThreeTTwelveGsmMatchedDiffCThreeA") for k in mac)
+
+
+# ------------------------------------------------------------------ files
+def test_summary_carries_provenance_inputs_and_the_pairing_rule(built):
+    s = built["summary"]
+    assert "git_commit" in s["provenance"]
+    assert s["pairing"]["seed"] == 20261030 and s["pairing"]["n_boot"] == 2000
+    assert s["pairing"]["tolerance"] == 0.10
+    assert "shared doc_ids" in s["pairing"]["rule"]
+    assert s["primary_speed"] == 2
+    kinds = {k.split(":")[0] for k in s["inputs"]}
+    assert {"records", "verdicts", "grid", "calibrator", "sanity"} <= kinds
+    for v in s["inputs"].values():
+        assert re.fullmatch(r"[0-9a-f]{64}", v["sha256"])
+    assert s["sanity"]["published"] == {"topk_conf[k=1]": 0.793, "threshold[tau=0.9]": 0.792}
+
+
+def body_rows(tex):
+    """The data rows of the tabular: the lines ending in a row break between the first and the last
+    rule (midrules and cmidrules end no row)."""
+    lines = tex.splitlines()
+    i = next(k for k, l in enumerate(lines) if l.startswith("\\toprule"))
+    j = next(k for k, l in enumerate(lines) if l.startswith("\\bottomrule"))
+    return [l for l in lines[i + 1:j] if l.rstrip().endswith("\\\\")]
+
+
+def test_table_is_a_bare_booktabs_tabular_one_row_per_decoder_tasks_side_by_side(built):
+    tex = (built["out"] / "t12" / "t12_matched_speed.tex").read_text()
+    assert "\\begin{tabular}" in tex and "\\end{tabular}" in tex
+    assert "\\toprule" in tex and "\\bottomrule" in tex and "\\midrule" in tex and "\\cmidrule" in tex
+    assert "\\begin{table" not in tex and "\\caption" not in tex
+    assert tex.count("\\begingroup") == tex.count("\\endgroup") == 1
+    assert "GSM8K" in tex and "MBPP" in tex
+    for name in ("Top-$k$", "Threshold", "Margin", "Entropy", "KLASS", "PC-Sampler", "C3a"):
+        # one row, both tasks (KLASS carries the off-operating-point dagger)
+        assert sum(l.startswith(name + (r"$^\dagger$" if name == "KLASS" else "") + " &")
+                   for l in tex.splitlines()) == 1, name
+    # entropy is unmatched at speed 2: both of its task groups are dashes
+    row = next(l for l in tex.splitlines() if l.startswith("Entropy"))
+    assert row.count("---") == 6                                   # (tok/step, acc, diff) x 2 tasks
+    # C3a's own row is the reference: no difference, in either task
+    assert next(l for l in tex.splitlines() if l.startswith("C3a &")).count("ref.") == 2
+    assert not any(c in tex for c in ("nan", "None"))
+    # seven columns: the decoder, then tok/step, acc, diff per task
+    assert re.search(r"\\begin\{tabular\}\{lrll(@\{\\hspace\{[^}]*\}\})?rll\}", tex)
+
+
+def test_table_is_compact_at_most_nine_body_rows(built):
+    """Sec. 6 has ~0.15 page: 2 header lines + one row per decoder, the tasks side by side."""
+    tex = (built["out"] / "t12" / "t12_matched_speed.tex").read_text()
+    rows = body_rows(tex)
+    assert len(rows) <= 9
+    assert len(rows) == 2 + len(P.DECODERS)
+    assert rows[0].count("\\multicolumn{3}") == 2                  # the task groups
+    assert rows[1].startswith("Decoder")
+    assert all(r.count("&") == 6 for r in rows[1:])               # 7 columns
+    assert "\\footnotesize" in tex and "\\tabcolsep" in tex
+    assert "$n$" not in tex                                       # no n column
+
+
+def test_sanity_cost_table_for_the_slides_and_makefile(built):
+    tex = (built["out"] / "t12" / "t12_sanity_cost.tex").read_text()
+    assert "\\begin{tabular}" in tex and "0.793" in tex and "0.792" in tex
+    assert "0.835" in tex and "0.845" in tex
+
+
+def test_sanity_cost_table_rows_and_columns(built):
+    tex = (built["out"] / "t12" / "t12_sanity_cost.tex").read_text()
+    assert "\\begin{tabular}" in tex and "\\begin{table" not in tex and "\\caption" not in tex
+    assert tex.count("\\begingroup") == tex.count("\\endgroup") == 1
+    assert "$n=200$" in tex and "published $0.793$" in tex and "published $0.792$" in tex
+    assert "[$0.777$, $0.880$]" in tex                            # the Wilson interval of top-k
+    # MBPP top-k: speed-3 has one failed problem -> fail column 1
+    row = [l for l in tex.splitlines() if l.startswith("Top-$k$ &")][1]
+    assert row.rstrip(" \\").endswith("& $1$ & $0$ & $0$")             # errors, timeouts, unstopped
+    assert "tok/st" in tex and "NFE" in tex
+
+
+def test_unstopped_and_timeouts_count_as_failures(tmp_path):
+    paths = make_fixture(tmp_path)
+    key = config_key(cfg_of("TopK", 2, "gsm8k"))
+    # one record that never hit a stop string, one verdict that timed out
+    f = paths["records"] / "sweep-gsm8k" / "t12.shard0of2.jsonl"
+    rows = [json.loads(l) for l in f.read_text().splitlines()]
+    for r in rows:
+        if r["config"] == key and r["doc_id"] == 2:
+            r["stopped"] = False
+    write_jsonl(f, rows)
+    vs = [json.loads(l) for l in paths["verdicts"].read_text().splitlines()]
+    for v in vs:
+        if v["config"] == key and v["doc_id"] == 3:
+            v["error"] = "timeout"
+    write_jsonl(paths["verdicts"], vs)
+    assert run_main(paths) == 0
+    s = json.loads((paths["out"] / "t12" / "llada-8b-instruct_fp16_t12-summary.json").read_text())
+    sp = s["tasks"]["gsm8k"]["decoders"]["TopK"]["speeds"]["2"]
+    assert (sp["failures"], sp["n_unstopped"], sp["n_timeout"], sp["n_failed_any"]) == (0, 1, 1, 2)
+
+
+def test_zip_tables_markdown_and_csv(built):
+    z = built["out"] / "t12" / "zip"
+    for stem in ("t12_sanity_cost", "t12_speed1_speed3"):
+        assert (z / f"{stem}.md").read_text().startswith("#")
+        assert (z / f"{stem}.csv").exists()
+    md = (z / "t12_sanity_cost.md").read_text()
+    assert "0.793" in md and "0.835" in md and "0.792" in md and "0.845" in md
+    rows = (z / "t12_sanity_cost.csv").read_text().splitlines()
+    head = rows[0].split(",")
+    assert {"task", "decoder", "speed", "tokens_per_step", "nfe", "seconds_per_problem", "failures"} <= set(head)
+    assert len([r for r in rows[1:] if r.startswith("mbpp,TopK,3,")]) == 1
+    sp = (z / "t12_speed1_speed3.csv").read_text().splitlines()
+    sh = sp[0].split(",")
+    assert {"task", "decoder", "speed", "acc", "acc_lo", "acc_hi", "matched_diff", "diff_lo", "diff_hi"} <= set(sh)
+    assert all(r.split(",")[sh.index("speed")] in ("1", "3") for r in sp[1:])
+
+
+def test_figure_is_written(built):
+    pytest.importorskip("matplotlib")
+    pdf = built["out"] / "t12" / "figures" / "t12_matched_speed.pdf"
+    assert pdf.exists() and pdf.read_bytes().startswith(b"%PDF")
+
+
+def test_rerun_is_byte_stable(tmp_path):
+    paths = make_fixture(tmp_path)
+    assert run_main(paths) == 0
+    a = (paths["out"] / "c3" / "macros_c3.tex").read_bytes()
+    t = (paths["out"] / "t12" / "t12_matched_speed.tex").read_bytes()
+    assert run_main(paths) == 0
+    assert (paths["out"] / "c3" / "macros_c3.tex").read_bytes() == a
+    assert (paths["out"] / "t12" / "t12_matched_speed.tex").read_bytes() == t
+
+
+def test_records_are_read_from_a_glob(tmp_path):
+    paths = make_fixture(tmp_path)
+    argv = ["--out-dir", str(paths["out"]), "--records", str(paths["records"] / "sweep-*" / "t12.shard*.jsonl"),
+            "--verdicts", str(paths["verdicts"]), "--grids", str(paths["grids"]),
+            "--calibrators", str(paths["cal"]), "--sanity", str(paths["sanity"]),
+            "--manifest-dir", str(paths["manifests"]), "--realised-risk", str(paths["risk"])]
+    assert P.main(argv) == 0
+    mac = parse_macros((paths["out"] / "c3" / "macros_c3.tex").read_text())
+    assert mac["CThreeTTwelveGsmN"] == "30"
+    assert mac["CThreeTTwelveGsmTopKSpeedOneTPS"] == "2.00"
+
+
+def test_duplicate_records_from_a_resumed_shard_count_once(tmp_path):
+    paths = make_fixture(tmp_path)
+    f = paths["records"] / "sweep-gsm8k" / "t12.shard0of2.jsonl"
+    f.write_text(f.read_text() + f.read_text().splitlines()[0] + "\n")
+    assert run_main(paths) == 0
+    s = json.loads((paths["out"] / "t12" / "llada-8b-instruct_fp16_t12-summary.json").read_text())
+    assert s["tasks"]["gsm8k"]["n"] == 30
+
+
+def test_score_rows_are_the_accuracy_when_there_are_no_verdicts(tmp_path):
+    paths = make_fixture(tmp_path, with_verdicts=False)
+    key = config_key(cfg_of("CThreeA", 2, "gsm8k"))
+    rows = [{"task": "gsm8k", "config": key, "half": "report", "prompt_format": "chat",
+             "run": P.run_key(meta_of("gsm8k", 0)), "n": 30, "n_correct": 24, "accuracy": 0.8, "ci95": [0.627, 0.905]}]
+    sc = tmp_path / "scores.json"
+    sc.write_text(json.dumps({"rows": rows}))
+    assert run_main(paths, "--scores", str(sc), verdicts=False) == 0
+    mac = parse_macros((paths["out"] / "c3" / "macros_c3.tex").read_text())
+    assert mac["CThreeTTwelveGsmCThreeASpeedTwoAcc"] == "0.800"
+    assert mac["CThreeTTwelveGsmCThreeASpeedTwoAccLo"] == "0.627"
+    assert "CThreeTTwelveGsmTopKSpeedTwoAcc" not in mac           # no score row, no verdict
+    assert "CThreeTTwelveGsmMatchedDiffTopKSpeedTwo" not in mac   # a difference needs the verdicts
+
+
+# ------------------------------------------------------------------ missing inputs
+@pytest.mark.parametrize("missing", ["records", "verdicts", "grids", "cal", "sanity"])
+def test_a_missing_input_never_crashes(tmp_path, missing):
+    paths = make_fixture(tmp_path)
+    flags = {"records": True, "verdicts": True, "grids": True, "cal": True, "sanity": True}
+    flags[missing] = False
+    assert run_main(paths, **flags) == 0
+    out = paths["out"]
+    assert (out / "t12" / "t12_matched_speed.tex").exists()
+    assert (out / "c3" / "macros_c3.tex").exists()
+    s = json.loads((out / "t12" / "llada-8b-instruct_fp16_t12-summary.json").read_text())
+    assert missing in "".join(s["missing_inputs"])
+
+
+def test_no_inputs_at_all_gives_dashes(tmp_path):
+    out = tmp_path / "out"
+    assert P.main(["--out-dir", str(out), "--records", str(tmp_path / "nope"),
+                   "--verdicts", str(tmp_path / "nope.jsonl"), "--grids", str(tmp_path / "nogrid"),
+                   "--calibrators", str(tmp_path / "nocal"), "--sanity", str(tmp_path / "nosanity.json")]) == 0
+    tex = (out / "t12" / "t12_matched_speed.tex").read_text()
+    assert "\\begin{tabular}" in tex and "---" in tex
+    mac = parse_macros((out / "c3" / "macros_c3.tex").read_text())
+    assert mac == {}                       # pending: the paper prints its bold ?
+    assert (out / "t12" / "llada-8b-instruct_fp16_t12-summary.json").exists()
+    assert (out / "t12" / "zip" / "t12_sanity_cost.md").exists()
+
+
+def test_missing_records_leave_t11_and_sanity_macros(tmp_path):
+    paths = make_fixture(tmp_path)
+    assert run_main(paths, records=False) == 0
+    mac = parse_macros((paths["out"] / "c3" / "macros_c3.tex").read_text())
+    assert "CThreeTElevenGsmFitDocs" in mac and "CThreeTTwelveSanityN" in mac
+    assert "CThreeTTwelveGsmCThreeASpeedTwoAlpha" in mac            # the grid's design constant
+    assert "CThreeTTwelveGsmN" not in mac and "CThreeTTwelveGsmTopKSpeedTwoAcc" not in mac
+
+
+def test_unreadable_json_is_a_dash_not_a_crash(tmp_path):
+    paths = make_fixture(tmp_path)
+    (paths["cal"] / "llada-8b-instruct_fp16_c3a-gsm8k.json").write_text("{not json")
+    (paths["sanity"]).write_text("")
+    assert run_main(paths) == 0
+    mac = parse_macros((paths["out"] / "c3" / "macros_c3.tex").read_text())
+    assert "CThreeTElevenGsmFitDocs" not in mac and "CThreeTElevenMbppFitDocs" in mac
+    assert "CThreeTTwelveSanityN" not in mac
+
+
+# ------------------------------------------------------------------ the paper
+PAPER = ROOT / "paper"
+USED = re.compile(r"\\Cres(CI)?\{([A-Za-z]+)\}")
+BARE = re.compile(r"\\(CThreeT(?:Eleven|Twelve)[A-Za-z]+)(?![A-Za-z<{\[])")
+
+
+def paper_macro_uses():
+    names = set()
+    text = (PAPER / "main.tex").read_text(encoding="utf-8")
+    for ci, name in USED.findall(text):
+        if name.startswith("CThree"):
+            names |= {name} | ({name + "Lo", name + "Hi"} if ci else set())
+    names |= set(BARE.findall(text))
+    return names
+
+
+def paper_file_uses():
+    files = set()
+    for f in ("main.tex", "Makefile"):
+        text = (PAPER / f).read_text(encoding="utf-8")
+        files |= set(re.findall(r"\.\./artifacts/((?:c3|t12)/[A-Za-z0-9_/\.]+)", text))
+    slides = (ROOT / "slides" / "slides.tex").read_text(encoding="utf-8")
+    files |= {f"t12/figures/{n}.pdf" for n in re.findall(r"\\CThreeFigure\{([A-Za-z0-9_]+)\}", slides)}
+    out = set()
+    for f in files:
+        f = f.rstrip(".")
+        out.add(f if Path(f).suffix else f + ".pdf")
+    return out
+
+
+def test_the_paper_uses_macros_the_script_defines(built):
+    used = paper_macro_uses()
+    assert len(used) >= 20
+    missing = sorted(used - set(built["macros"]))
+    assert not missing, f"the paper uses macros the script does not define: {missing}"
+
+
+def test_the_paper_inputs_files_the_script_writes(built):
+    files = paper_file_uses()
+    assert {"t12/figures/t12_matched_speed.pdf"} <= files
+    for f in files:
+        assert (built["out"] / f).exists(), f"the paper reads artifacts/{f}; the script did not write it"
+
+
+def test_no_macro_is_defined_that_the_naming_scheme_does_not_allow(built):
+    dec = "|".join(DEC_POLICY)
+    task = "Gsm|Mbpp"
+    speed = "SpeedOne|SpeedTwo|SpeedThree"
+    allowed = [
+        rf"CThreeTEleven({task})(FitDocs|MonotoneShare|DevECERaw|DevECECal)",
+        rf"CThreeTEleven({task})ReportECE(Raw|Cal)(Lo|Hi)?",
+        rf"CThreeTTwelve({task})N",
+        rf"CThreeTTwelve({task})({dec})({speed})(Acc|AccLo|AccHi|TPS|NFE|Sec)",
+        rf"CThreeTTwelve({task})MatchedDiff({dec})({speed})(Lo|Hi)?",
+        rf"CThreeTTwelve({task})OutsideShare",
+        r"CThreeTTwelveSanity(TopK|Threshold)Acc(Lo|Hi)?", r"CThreeTTwelveSanityN",
+        rf"CThreeTTwelve({task})CThreeA({speed})Alpha", rf"CThreeTTwelve({task})AlphaPrimary",
+    ]
+    for name in built["macros"]:
+        assert any(re.fullmatch(p, name) for p in allowed), name
+
+
+def test_cost_table_never_uses_scientific_notation(built):
+    tex = (built["out"] / "t12" / "t12_sanity_cost.tex").read_text()
+    assert "\times" not in tex and "$128.0$" in tex
+
+
+# ------------------------------------------------------------------ plumbing: completeness, runs, halves
+def edit_rows(path, fn):
+    rows = [json.loads(l) for l in path.read_text().splitlines()]
+    write_jsonl(path, fn(rows))
+
+
+def cap_at(paths, k, tasks=("gsm8k", "mbpp")):
+    """Every configuration stopped after doc k-1 (problems are the outer loop: a time cap)."""
+    for t in tasks:
+        for f in (paths["records"] / f"sweep-{t}").glob("t12.shard*.jsonl"):
+            edit_rows(f, lambda rows: [r for r in rows if r["doc_id"] < k])
+
+
+def summary_of(paths):
+    return json.loads((paths["out"] / "t12" / "llada-8b-instruct_fp16_t12-summary.json").read_text())
+
+
+def test_missing_shard_is_refused_and_writes_nothing(tmp_path):
+    paths = make_fixture(tmp_path)
+    d = paths["records"] / "sweep-gsm8k"
+    (d / "t12.shard1of2.jsonl").unlink()
+    (d / "t12.shard1of2.meta.json").unlink()
+    with pytest.raises(SystemExit) as e:
+        run_main(paths)
+    assert "shard" in str(e.value) and "gsm8k" in str(e.value)
+    assert not (paths["out"] / "c3" / "macros_c3.tex").exists()
+
+
+def test_a_cap_at_doc_k_is_refused_with_and_without_the_manifest(tmp_path):
+    paths = make_fixture(tmp_path)
+    cap_at(paths, 20)
+    with pytest.raises(SystemExit) as e:
+        run_main(paths)
+    assert "20/30" in str(e.value)
+    with pytest.raises(SystemExit):                       # the metas' doc_ids alone give the 30
+        run_main(paths, manifests=False)
+
+
+def test_a_config_cut_short_inside_the_last_problem_is_refused(tmp_path):
+    paths = make_fixture(tmp_path)
+    f = paths["records"] / "sweep-gsm8k" / "t12.shard0of2.jsonl"
+    edit_rows(f, lambda rows: [r for r in rows if not (r["doc_id"] == 28 and r["config"].startswith("c3a"))])
+    with pytest.raises(SystemExit) as e:
+        run_main(paths)
+    assert "29/30" in str(e.value)
+
+
+def test_allow_partial_with_a_missing_shard_reports_n_of_the_complete_problems(tmp_path):
+    paths = make_fixture(tmp_path)
+    d = paths["records"] / "sweep-gsm8k"
+    (d / "t12.shard1of2.jsonl").unlink()
+    (d / "t12.shard1of2.meta.json").unlink()
+    assert run_main(paths, "--allow-partial") == 0
+    s = summary_of(paths)
+    g = s["tasks"]["gsm8k"]
+    assert (g["n"], g["n_complete"], g["n_planned"], g["partial"]) == (15, 15, 30, True)
+    assert (g["n_dropped_problems"], g["n_dropped_records"]) == (0, 0)     # the shard is absent, not cut
+    assert g["decoders"]["TopK"]["speeds"]["2"]["n_planned"] == 30
+    assert s["tasks"]["mbpp"]["partial"] is False
+    tex = (paths["out"] / "t12" / "t12_matched_speed.tex").read_text()
+    assert "$N=15$" in tex and "$N=30$" in tex and "partial" not in tex
+    mtex = (paths["out"] / "c3" / "macros_c3.tex").read_text()
+    assert "% PARTIAL: gsm8k N=15 of 30 planned" in mtex
+    assert "\\newcommand{\\CThreeTTwelveGsmN}{15}" in mtex
+    assert "gsm8k N=15" in (paths["out"] / "t12" / "zip" / "t12_sanity_cost.md").read_text()
+
+
+def test_complete_run_has_no_partial_marker(built):
+    assert "partial" not in (built["out"] / "t12" / "t12_matched_speed.tex").read_text()
+    assert "PARTIAL" not in (built["out"] / "c3" / "macros_c3.tex").read_text()
+    g = built["summary"]["tasks"]["gsm8k"]
+    assert (g["n"], g["n_complete"], g["n_planned"], g["partial"]) == (30, 30, 30, False)
+    assert (g["n_dropped_problems"], g["n_dropped_records"]) == (0, 0)
+    assert g["prefix_check"] == {"ok": True, "violations": []}
+    assert "kept problems" in g["rule"] and built["summary"]["completeness_rule"] == g["rule"]
+
+
+def test_two_runs_for_one_task_are_refused(tmp_path):
+    paths = make_fixture(tmp_path)
+    # an Ada copy of the same sweep next to the Jarvis run: different model revision / machine
+    src = paths["records"] / "sweep-gsm8k"
+    dst = paths["records"] / "ada-copy-gsm8k"
+    dst.mkdir()
+    for f in src.glob("t12.shard*"):
+        (dst / f.name).write_text(f.read_text())
+    for sh in (0, 1):
+        m = json.loads((dst / f"t12.shard{sh}of2.meta.json").read_text())
+        m["model_revision"] = "other"
+        (dst / f"t12.shard{sh}of2.meta.json").write_text(json.dumps(m))
+    with pytest.raises(SystemExit) as e:
+        run_main(paths)
+    assert "more than one run" in str(e.value) and "gsm8k" in str(e.value)
+
+
+def test_verdicts_of_another_run_are_ignored_and_non_verdict_lines_skipped(tmp_path):
+    paths = make_fixture(tmp_path)
+    key = config_key(cfg_of("CThreeA", 2, "gsm8k"))
+    vs = [json.loads(l) for l in paths["verdicts"].read_text().splitlines()]
+    other = [dict(v, run="deadbeef0000", correct=False) for v in vs if v["config"] == key and v["task"] == "gsm8k"]
+    rec_line = {"config": key, "task": "gsm8k", "doc_id": 0, "completion": "x", "n_forward": 1}   # no `correct`
+    write_jsonl(paths["verdicts"], other + vs[:1] + [rec_line] + vs[1:])
+    assert run_main(paths) == 0
+    s = summary_of(paths)["tasks"]["gsm8k"]["decoders"]["CThreeA"]["speeds"]["2"]
+    assert s["n_correct"] == 24 and s["n_scored"] == 30
+
+
+def test_a_fit_half_doc_id_is_refused(tmp_path):
+    paths = make_fixture(tmp_path)
+    f = paths["records"] / "sweep-gsm8k" / "t12.shard0of2.jsonl"
+    edit_rows(f, lambda rows: rows + [dict(rows[0], doc_id=JUNK_DOC)])
+    with pytest.raises(SystemExit) as e:
+        run_main(paths)
+    assert "fit" in str(e.value)
+
+
+def test_a_shard_without_a_meta_file_is_refused(tmp_path):
+    paths = make_fixture(tmp_path)
+    (paths["records"] / "sweep-gsm8k" / "t12.shard0of2.meta.json").unlink()
+    with pytest.raises(SystemExit) as e:
+        run_main(paths)
+    assert "meta" in str(e.value)
+
+
+@pytest.mark.parametrize("over,word", [({"precision": "bf16"}, "fp16"),
+                                       ({"prompt": {"format": "lmeval", "fewshot": 5}}, "chat")])
+def test_meta_must_say_fp16_and_the_chat_prompt(tmp_path, over, word):
+    paths = make_fixture(tmp_path)
+    for sh in (0, 1):
+        mp = paths["records"] / "sweep-gsm8k" / f"t12.shard{sh}of2.meta.json"
+        m = json.loads(mp.read_text())
+        m.update(over)
+        mp.write_text(json.dumps(m))
+    with pytest.raises(SystemExit) as e:
+        run_main(paths)
+    assert word in str(e.value)
+
+
+def test_duplicate_with_a_different_completion_warns_but_identical_does_not(tmp_path):
+    paths = make_fixture(tmp_path)
+    f = paths["records"] / "sweep-gsm8k" / "t12.shard0of2.jsonl"
+    rows = [json.loads(l) for l in f.read_text().splitlines()]
+    write_jsonl(f, rows + [rows[0]])                       # identical resumed line
+    assert run_main(paths) == 0
+    assert not any("different completion" in w for w in summary_of(paths)["warnings"])
+    write_jsonl(f, rows + [dict(rows[0], completion="y")])
+    assert run_main(paths) == 0
+    assert any("different completion" in w for w in summary_of(paths)["warnings"])
+
+
+# ------------------------------------------------------------------ driver errors, columns, rule text
+def inject_driver_error(paths, dec="TopK", slot=2, doc=5, task="gsm8k"):
+    key = config_key(cfg_of(dec, slot, task))
+    f = paths["records"] / f"sweep-{task}" / f"t12.shard{doc % 2}of2.jsonl"
+
+    def fn(rows):
+        for r in rows:
+            if r["config"] == key and r["doc_id"] == doc:
+                for k in ("n_forward", "n_committed", "tokens_per_step", "seconds", "stopped"):
+                    r.pop(k, None)
+                r.update({"completion": None, "error": "OutOfMemoryError: out of memory"})
+        return rows
+    edit_rows(f, fn)
+    vs = [json.loads(l) for l in paths["verdicts"].read_text().splitlines()]
+    for v in vs:
+        if v["task"] == task and v["config"] == key and v["doc_id"] == doc:
+            v.update({"correct": False, "driver_error": True})
+    write_jsonl(paths["verdicts"], vs)
+    return key
+
+
+def test_driver_errors_warn_are_scored_wrong_and_leave_the_speed_over_the_rest(tmp_path):
+    paths = make_fixture(tmp_path)
+    inject_driver_error(paths)
+    assert run_main(paths) == 0
+    s = summary_of(paths)
+    sp = s["tasks"]["gsm8k"]["decoders"]["TopK"]["speeds"]["2"]
+    assert (sp["n"], sp["n_ok"], sp["failures"]) == (30, 29, 1)
+    nfes = [nfe_of("TopK", 2, i) for i in range(N_DOCS) if i != 5]
+    assert sp["tps"] == pytest.approx(256 * 29 / sum(nfes))               # 256 N_ok / sum NFE_ok, no imputing
+    assert sp["n_scored"] == 30 and sp["n_correct"] == sum(correct_of("gsm8k", "TopK", 2, i) for i in range(N_DOCS) if i != 5)
+    assert any("driver error" in w and "TopK" in w or "driver error" in w and "topk_conf" in w for w in s["warnings"])
+    tex = (paths["out"] / "t12" / "t12_matched_speed.tex").read_text()
+    # Sec. 6 has no line to spare: the matched table carries the note as a LaTeX comment only; the
+    # footnote is in the sanity/cost table, n_ok in the zip tables, the counts in the summary JSON
+    assert "% driver errors scored wrong; speed is over the problems that decoded: GSM8K Top-$k$: 29/30 decoded" in tex
+    assert "\\scriptsize" not in tex.replace("{\\scriptsize[", "") and len(body_rows(tex)) == 2 + len(P.DECODERS)
+    cost = (paths["out"] / "t12" / "t12_sanity_cost.tex").read_text()
+    assert "speed is over the problems that decoded" in cost
+
+
+def test_no_driver_errors_no_footnote(built):
+    assert "driver errors scored wrong" not in (built["out"] / "t12" / "t12_matched_speed.tex").read_text()
+
+
+def test_n_ok_is_in_the_zip_tables(built):
+    z = built["out"] / "t12" / "zip"
+    head = (z / "t12_sanity_cost.csv").read_text().splitlines()[0].split(",")
+    assert "n_ok" in head
+    row = next(r for r in (z / "t12_sanity_cost.csv").read_text().splitlines() if r.startswith("mbpp,TopK,3,"))
+    assert row.split(",")[head.index("n_ok")] == "29"
+    assert "n_ok" in (z / "t12_speed1_speed3.csv").read_text().splitlines()[0].split(",")
+
+
+def test_matched_table_has_no_n_column_but_names_a_short_pairing(built):
+    tex = (built["out"] / "t12" / "t12_matched_speed.tex").read_text()
+    assert "$n$" not in tex and "$N=30$" in tex                       # N is in the task header
+    assert "paired on fewer" not in tex                               # every difference is paired on all N
+    assert built["summary"]["tasks"]["gsm8k"]["matched"]["2"]["TopK"]["n_paired"] == 30
+    S = json.loads(json.dumps(built["summary"]))
+    S["tasks"]["gsm8k"]["matched"]["2"]["TopK"]["n_paired"] = 28
+    tex = P.matched_table(S)
+    assert "% difference paired on fewer than N problems: GSM8K Top-$k$: 28" in tex
+    assert len(body_rows(tex)) == 2 + len(P.DECODERS)                 # still no footnote row
+
+
+def test_fail_columns_are_split(built):
+    tex = (built["out"] / "t12" / "t12_sanity_cost.tex").read_text()
+    assert "err" in tex and "t/o" in tex and "uns" in tex
+    assert tex.count("{13}") >= 1 and "{11}" not in tex
+
+
+def test_tie_rule_is_in_the_pairing_rule(built):
+    assert "tie" in built["summary"]["pairing"]["rule"] and "lower" in built["summary"]["pairing"]["rule"]
+    equal = {1: {"tps": 3.6, "unmatched": False}, 2: {"tps": 4.4, "unmatched": False}}
+    assert P.match_baseline(2, 4.0, equal)["slot"] == 1               # equidistant: the lower slot
+
+
+# ------------------------------------------------------------------ a second complete run of a task
+def copy_run(paths, dst_name, num_shards=None, **meta_over):
+    """A complete copy of the gsm8k sweep in a sibling directory (the reviewer's 'Ada copy next to
+    the Jarvis run'), optionally with another num_shards / meta fields.  The pinned inputs are the same, so
+    score_t12's RUN_FIELDS hash is the same: only the other facts can tell the two apart."""
+    src = paths["records"] / "sweep-gsm8k"
+    dst = paths["records"] / dst_name
+    dst.mkdir()
+    for sh in (0, 1):
+        n = num_shards or 2
+        (dst / f"t12.shard{sh}of{n}.jsonl").write_text((src / f"t12.shard{sh}of2.jsonl").read_text())
+        m = json.loads((src / f"t12.shard{sh}of2.meta.json").read_text())
+        m.update({"num_shards": n, **meta_over})
+        (dst / f"t12.shard{sh}of{n}.meta.json").write_text(json.dumps(m))
+    return dst
+
+
+def test_the_runs_of_two_copies_share_the_run_key():
+    # the premise of the reviewer's case: nothing in RUN_FIELDS tells the copies apart
+    assert P.run_key(meta_of("gsm8k", 0)) == P.run_key(meta_of("gsm8k", 0, num_shards=12, label="ada"))
+
+
+def test_a_complete_copy_with_other_num_shards_is_refused(tmp_path):
+    paths = make_fixture(tmp_path)
+    copy_run(paths, "ada-copy-gsm8k", num_shards=12)
+    with pytest.raises(SystemExit) as e:
+        run_main(paths)
+    assert "more than one run" in str(e.value) and "num_shards" in str(e.value)
+    assert not (paths["out"] / "c3" / "macros_c3.tex").exists()
+
+
+def test_a_complete_copy_with_the_same_num_shards_in_another_directory_is_refused(tmp_path):
+    paths = make_fixture(tmp_path)
+    copy_run(paths, "ada-copy-gsm8k")
+    with pytest.raises(SystemExit) as e:
+        run_main(paths)
+    assert "more than one run" in str(e.value) and "director" in str(e.value)
+
+
+@pytest.mark.parametrize("over,word", [({"label": "ada"}, "label"),
+                                       ({"provenance": {"host": "gnode006", "gpu": "RTX 2080 Ti"}}, "host")])
+def test_shards_of_one_task_must_agree_on_label_and_machine(tmp_path, over, word):
+    paths = make_fixture(tmp_path)
+    mp = paths["records"] / "sweep-gsm8k" / "t12.shard1of2.meta.json"
+    m = json.loads(mp.read_text())
+    m.update(over)
+    mp.write_text(json.dumps(m))
+    with pytest.raises(SystemExit) as e:
+        run_main(paths)
+    assert word in str(e.value)
+
+
+def test_the_same_problem_in_two_shard_files_is_refused(tmp_path):
+    paths = make_fixture(tmp_path)
+    d = paths["records"] / "sweep-gsm8k"
+    rows0 = [json.loads(l) for l in (d / "t12.shard0of2.jsonl").read_text().splitlines()]
+    f1 = d / "t12.shard1of2.jsonl"
+    edit_rows(f1, lambda rows: rows + [rows0[0]])            # doc 0 is shard 0's
+    with pytest.raises(SystemExit) as e:
+        run_main(paths)
+    assert "two shard files" in str(e.value)
+
+
+def test_an_identical_duplicate_inside_one_shard_file_still_only_warns(tmp_path):
+    paths = make_fixture(tmp_path)
+    f = paths["records"] / "sweep-gsm8k" / "t12.shard0of2.jsonl"
+    f.write_text(f.read_text() + f.read_text().splitlines()[0] + "\n")
+    assert run_main(paths) == 0
+    assert any("repeated" in w for w in summary_of(paths)["warnings"])
+
+
+# ------------------------------------------------------------------ PR #62 review: accuracy and verdict plumbing
+C3A_KEY = config_key(cfg_of("CThreeA", 2, "gsm8k"))
+
+
+def drop_verdicts(paths, key, keep=lambda v: False):
+    vs = [json.loads(l) for l in paths["verdicts"].read_text().splitlines()]
+    write_jsonl(paths["verdicts"], [v for v in vs if not (v["config"] == key and v["task"] == "gsm8k") or keep(v)])
+
+
+def test_failures_alone_never_become_the_accuracy(tmp_path):
+    """C3a with driver errors and no verdict at all used to score 0.0 on its two failures, and a
+    paired difference of -1.0."""
+    paths = make_fixture(tmp_path)
+    inject_driver_error(paths, "CThreeA", 2, 5)
+    inject_driver_error(paths, "CThreeA", 2, 6)
+    drop_verdicts(paths, C3A_KEY, keep=lambda v: v["driver_error"])      # only the two failed docs have verdicts
+    drop_verdicts(paths, C3A_KEY)                                        # ... and now none at all
+    assert run_main(paths) == 0
+    s = summary_of(paths)
+    sp = s["tasks"]["gsm8k"]["decoders"]["CThreeA"]["speeds"]["2"]
+    assert sp.get("acc") is None and "n_scored" not in sp
+    mac = parse_macros((paths["out"] / "c3" / "macros_c3.tex").read_text())
+    assert "CThreeTTwelveGsmCThreeASpeedTwoAcc" not in mac
+    assert "CThreeTTwelveGsmMatchedDiffTopKSpeedTwo" not in mac           # a difference needs both accuracies
+    assert not any(v.endswith("1.000") for k, v in mac.items() if "MatchedDiff" in k)
+    assert s["tasks"]["gsm8k"]["matched"]["2"]["TopK"]["diff"] is None
+    assert any("accuracy left blank" in w and "gsm8k" in w for w in s["warnings"])
+
+
+def test_failures_are_imputed_to_zero_next_to_real_verdicts_only(tmp_path):
+    paths = make_fixture(tmp_path)
+    inject_driver_error(paths, "CThreeA", 2, 5)                          # its verdict says wrong; keep it
+    drop_verdicts(paths, C3A_KEY, keep=lambda v: v["doc_id"] != 5)       # the failed doc has no verdict line
+    assert run_main(paths) == 0
+    sp = summary_of(paths)["tasks"]["gsm8k"]["decoders"]["CThreeA"]["speeds"]["2"]
+    assert (sp["n_scored"], sp["n_correct"]) == (30, 24 - (1 if correct_of("gsm8k", "CThreeA", 2, 5) else 0))
+
+
+def test_the_score_row_is_used_when_a_config_has_no_verdicts(tmp_path):
+    paths = make_fixture(tmp_path)
+    inject_driver_error(paths, "CThreeA", 2, 5)
+    inject_driver_error(paths, "CThreeA", 2, 6)
+    drop_verdicts(paths, C3A_KEY)
+    sc = tmp_path / "scores.json"
+    sc.write_text(json.dumps({"rows": [{"task": "gsm8k", "config": C3A_KEY, "half": "report", "prompt_format": "chat",
+                                        "run": P.run_key(meta_of("gsm8k", 0)), "n": 30, "n_correct": 22,
+                                        "accuracy": 22 / 30, "ci95": [0.55, 0.85]}]}))
+    assert run_main(paths, "--scores", str(sc)) == 0
+    s = summary_of(paths)
+    sp = s["tasks"]["gsm8k"]["decoders"]["CThreeA"]["speeds"]["2"]
+    assert (sp["n_correct"], sp["n_scored"]) == (22, 30)
+    assert s["tasks"]["gsm8k"]["matched"]["2"]["TopK"]["diff"] is None   # no verdicts: no paired difference
+
+
+def test_a_score_row_with_fewer_problems_than_records_is_blank(tmp_path):
+    paths = make_fixture(tmp_path)
+    drop_verdicts(paths, C3A_KEY)
+    sc = tmp_path / "scores.json"
+    sc.write_text(json.dumps({"rows": [{"task": "gsm8k", "config": C3A_KEY, "half": "report", "prompt_format": "chat",
+                                        "run": P.run_key(meta_of("gsm8k", 0)), "n": 20, "n_correct": 15,
+                                        "accuracy": 0.75, "ci95": [0.5, 0.9]}]}))
+    assert run_main(paths, "--scores", str(sc)) == 0
+    assert summary_of(paths)["tasks"]["gsm8k"]["decoders"]["CThreeA"]["speeds"]["2"].get("acc") is None
+
+
+def test_a_config_with_some_verdicts_missing_has_no_accuracy(tmp_path):
+    paths = make_fixture(tmp_path)
+    drop_verdicts(paths, C3A_KEY, keep=lambda v: v["doc_id"] < 22)       # 8 records lack a verdict
+    assert run_main(paths) == 0
+    s = summary_of(paths)
+    assert s["tasks"]["gsm8k"]["decoders"]["CThreeA"]["speeds"]["2"].get("acc") is None
+    assert any("8 of 30" in w for w in s["warnings"])
+
+
+def test_a_stale_run_less_verdict_file_in_the_directory_does_not_win(tmp_path):
+    paths = make_fixture(tmp_path)
+    good = [json.loads(l) for l in paths["verdicts"].read_text().splitlines()]
+    vdir = tmp_path / "verdicts"
+    vdir.mkdir()
+    stale = [{k: v for k, v in dict(g, correct=False).items() if k != "run"} for g in good]
+    write_jsonl(vdir / "a_stale.jsonl", stale)                       # read first, no run key
+    write_jsonl(vdir / "b_current.jsonl", good)
+    paths["verdicts"] = vdir
+    assert run_main(paths) == 0
+    s = summary_of(paths)
+    sp = s["tasks"]["gsm8k"]["decoders"]["CThreeA"]["speeds"]["2"]
+    assert sp["n_correct"] == 24
+    assert any("without a run" in w for w in s["warnings"])
+
+
+def test_verdicts_are_keyed_by_run(tmp_path):
+    paths = make_fixture(tmp_path)
+    vs = [json.loads(l) for l in paths["verdicts"].read_text().splitlines()]
+    write_jsonl(paths["verdicts"], vs)
+    vd = P.load_verdicts([paths["verdicts"]], [], {}, {P.run_key(meta_of("gsm8k", 0))})
+    assert (P.run_key(meta_of("gsm8k", 0)), "gsm8k", C3A_KEY) in vd
+
+
+def test_macros_round_like_the_table():
+    # a CI that excludes 0 but prints 0.000 at 3 decimals: both raise the decimals together
+    m = P.Macros()
+    P.est_macros(m, "X", 0.0004, 0.0002, 0.0007)
+    bodies = {line.split("{")[1][1:-1]: line.split("}{")[1][:-1] for line in m.lines}
+    assert bodies == {"X": "0.0004", "XLo": "0.0002", "XHi": "0.0007"}
+    cell = P.est_ci({"value": 0.0004, "ci": [0.0002, 0.0007]})
+    assert "0.0004" in cell and "0.0002" in cell and "0.0007" in cell
+    m = P.Macros()
+    P.est_macros(m, "Y", -0.0204, -0.04, 0.0004)
+    assert [line.split("}{")[1][:-1] for line in m.lines] == ["\\ensuremath{-}0.020", "\\ensuremath{-}0.040", "0.000"]
+
+
+def test_the_difference_header_matches_the_caption(built):
+    tex = (built["out"] / "t12" / "t12_matched_speed.tex").read_text()
+    assert "C3a $-$ decoder [95\\% CI]" in tex and "\\Delta" not in tex
+
+
+def test_a_fit_half_shard_under_records_is_refused(tmp_path):
+    paths = make_fixture(tmp_path)
+    cal = paths["records"] / "calibrate-gsm8k"
+    cal.mkdir()
+    write_jsonl(cal / "t12.shard0of1.jsonl", [{"config": "topk_conf[k=2]", "task": "gsm8k", "doc_id": 1000}])
+    (cal / "t12.shard0of1.meta.json").write_text(json.dumps(meta_of("gsm8k", 0, half="fit", num_shards=1)))
+    with pytest.raises(SystemExit) as e:
+        run_main(paths)
+    assert "fit" in str(e.value)
+
+
+# ------------------------------------------------------------------ the completeness rule (deviation 17)
+# 3 shards of 4 problems (shard s holds docs s, s+3, s+6, s+9); the last problem of each shard (9, 10,
+# 11) is incomplete: doc 9 lacks C3a, doc 10 has top-k only, doc 11 lacks one configuration.
+R_DOCS, R_SHARDS = 12, 3
+PARTIAL_DOCS = (9, 10, 11)
+KEPT_N = 9
+
+
+def _keep(doc, r):
+    if doc == 9:
+        return not r["config"].startswith("c3a")
+    if doc == 10:
+        return r["config"].startswith("topk_conf")
+    return r["config"] != config_key(cfg_of("Klass", 3, r["task"]))
+
+
+def partial_fixture(root):
+    paths = make_fixture(root, nshards=R_SHARDS, n_docs=R_DOCS)
+    for task in TASKS:
+        for f in (paths["records"] / f"sweep-{task}").glob("t12.shard*.jsonl"):
+            edit_rows(f, lambda rows: [r for r in rows if r["doc_id"] not in PARTIAL_DOCS or _keep(r["doc_id"], r)])
+    return paths
+
+
+def n_records_cut():
+    return sum(1 for doc in PARTIAL_DOCS for dec in DEC_POLICY for s in (1, 2, 3)
+               if _keep(doc, {"config": config_key(cfg_of(dec, s, "gsm8k")), "task": "gsm8k"}))
+
+
+def test_partial_problems_are_refused_without_the_flag_and_nothing_is_written(tmp_path):
+    paths = partial_fixture(tmp_path)
+    with pytest.raises(SystemExit) as e:
+        run_main(paths)
+    assert "--allow-partial" in str(e.value) and "fewer than the 12" in str(e.value)
+    assert not (paths["out"] / "c3" / "macros_c3.tex").exists()
+
+
+def test_n_is_the_number_of_complete_problems_everywhere(tmp_path):
+    paths = partial_fixture(tmp_path)
+    assert run_main(paths, "--allow-partial") == 0
+    s = summary_of(paths)
+    for task in TASKS:
+        t = s["tasks"][task]
+        assert (t["n"], t["n_complete"], t["n_planned"]) == (KEPT_N, KEPT_N, R_DOCS)
+        assert t["n_dropped_problems"] == 3
+        assert t["n_dropped_records"] == n_records_cut() == 18 + 3 + 20
+        assert "kept problems" in t["rule"] and "every configuration" in t["rule"]
+        assert t["prefix_check"] == {"ok": True, "violations": []}
+        assert {sp["n"] for d in t["decoders"].values() for sp in d["speeds"].values()} == {KEPT_N}
+        assert {sp["n_scored"] for d in t["decoders"].values() for sp in d["speeds"].values()
+                if "n_scored" in sp} == {KEPT_N}
+        assert {e["n_paired"] for per in t["matched"].values() for e in per.values() if e["matched"]} == {KEPT_N}
+    mac = parse_macros((paths["out"] / "c3" / "macros_c3.tex").read_text())
+    assert mac["CThreeTTwelveGsmN"] == mac["CThreeTTwelveMbppN"] == str(KEPT_N)
+    tex = (paths["out"] / "t12" / "t12_matched_speed.tex").read_text()
+    assert tex.count(f"$N={KEPT_N}$") == 2 and "/12" not in tex and "partial" not in tex
+    assert f"$N={KEPT_N}$" in (paths["out"] / "t12" / "t12_sanity_cost.tex").read_text()
+    assert "% PARTIAL: gsm8k N=9 of 12 planned" in (paths["out"] / "c3" / "macros_c3.tex").read_text()
+    assert any("kept 9 of 12 planned problems" in w for w in s["warnings"])
+
+
+def _artifacts(paths):
+    out = paths["out"]
+    files = {"macros": out / "c3" / "macros_c3.tex", "table": out / "t12" / "t12_matched_speed.tex",
+             "cost": out / "t12" / "t12_sanity_cost.tex"}
+    files |= {f"zip:{f.name}": f for f in sorted((out / "t12" / "zip").glob("*.csv"))}
+    return {k: f.read_text() for k, f in files.items()}
+
+
+def test_dropped_records_change_no_number(tmp_path):
+    """The same run without the three incomplete problems at all gives identical accuracy, speed,
+    matching, bootstrap, macros, tables and CSVs."""
+    a = partial_fixture(tmp_path / "partial")
+    b = make_fixture(tmp_path / "clean", nshards=R_SHARDS, n_docs=KEPT_N)
+    assert run_main(a, "--allow-partial") == 0
+    assert run_main(b) == 0
+    sa, sb = summary_of(a), summary_of(b)
+    for task in TASKS:
+        ta, tb = sa["tasks"][task], sb["tasks"][task]
+        for t in (ta, tb):                                             # only the planned N differs (12 vs 9)
+            for d in t["decoders"].values():
+                for sp in d["speeds"].values():
+                    sp.pop("n_planned")
+        assert ta["decoders"] == tb["decoders"]                        # acc, ci, tps, nfe, seconds, counts
+        assert ta["matched"] == tb["matched"]                          # diff, lo, hi (the bootstrap), n_paired
+        assert ta["outside_share"] == tb["outside_share"]
+        assert ta["alpha"] == tb["alpha"]
+        assert tb["n_dropped_problems"] == 0 and ta["n_dropped_problems"] == 3
+        assert {m["n_paired"] for per in ta["matched"].values() for m in per.values() if m["matched"]} == {KEPT_N}
+        assert any(m["lo"] is not None for per in ta["matched"].values() for m in per.values() if m["matched"])
+    art_a, art_b = _artifacts(a), _artifacts(b)
+    macros_a = parse_macros(art_a.pop("macros"))
+    macros_b = parse_macros(art_b.pop("macros"))
+    assert macros_a == macros_b
+    assert art_a == art_b
+
+
+def test_an_error_record_counts_as_finished(tmp_path):
+    """A driver error is a finished record (scored wrong): its problem is kept, no flag needed."""
+    paths = make_fixture(tmp_path, nshards=R_SHARDS, n_docs=R_DOCS)
+    key = config_key(cfg_of("CThreeA", 2, "gsm8k"))
+
+    def to_error(rows):
+        for r in rows:
+            if r["doc_id"] == R_DOCS - 1 and r["config"] == key:
+                r.update({"completion": None, "error": "OutOfMemoryError: out of memory", "n_forward": None,
+                          "tokens_per_step": None, "seconds": None})
+                r.pop("c3a_steps", None)
+        return rows
+
+    for f in (paths["records"] / "sweep-gsm8k").glob("t12.shard*.jsonl"):
+        edit_rows(f, to_error)
+    assert run_main(paths) == 0                                        # complete: no --allow-partial
+    g = summary_of(paths)["tasks"]["gsm8k"]
+    assert (g["n"], g["n_complete"], g["n_dropped_problems"], g["n_dropped_records"]) == (R_DOCS, R_DOCS, 0, 0)
+    sp = g["decoders"]["CThreeA"]["speeds"]["2"]
+    assert (sp["n"], sp["failures"], sp["n_ok"]) == (R_DOCS, 1, R_DOCS - 1)
+
+
+def test_a_missing_record_is_not_an_error_record(tmp_path):
+    paths = make_fixture(tmp_path, nshards=R_SHARDS, n_docs=R_DOCS)
+    key = config_key(cfg_of("CThreeA", 2, "gsm8k"))
+    for f in (paths["records"] / "sweep-gsm8k").glob("t12.shard*.jsonl"):
+        edit_rows(f, lambda rows: [r for r in rows if not (r["doc_id"] == R_DOCS - 1 and r["config"] == key)])
+    assert run_main(paths, "--allow-partial") == 0
+    g = summary_of(paths)["tasks"]["gsm8k"]
+    assert (g["n"], g["n_dropped_problems"], g["n_dropped_records"]) == (R_DOCS - 1, 1, 20)
+    assert summary_of(paths)["tasks"]["mbpp"]["n"] == R_DOCS
+
+
+def test_a_gap_that_is_not_a_prefix_is_a_loud_warning_not_a_failure(tmp_path, capsys):
+    paths = make_fixture(tmp_path, nshards=R_SHARDS, n_docs=R_DOCS)
+    key = config_key(cfg_of("CThreeA", 2, "gsm8k"))
+    f = paths["records"] / "sweep-gsm8k" / "t12.shard0of3.jsonl"              # shard 0: docs 0, 3, 6, 9
+    edit_rows(f, lambda rows: [r for r in rows if not (r["doc_id"] == 3 and r["config"] == key)])
+    assert run_main(paths, "--allow-partial") == 0                     # warns, does not fail
+    s = summary_of(paths)
+    g = s["tasks"]["gsm8k"]
+    assert g["n"] == R_DOCS - 1 and g["n_dropped_problems"] == 1
+    pc = g["prefix_check"]
+    assert pc["ok"] is False and len(pc["violations"]) == 1
+    v = pc["violations"][0]
+    assert v["file"].endswith("t12.shard0of3.jsonl") and v["first_dropped"] == 3 and v["kept_after_gap"] == [6, 9]
+    assert any("NOT A PREFIX" in w for w in s["warnings"])
+    assert "NOT A PREFIX" in capsys.readouterr().err
+    assert "% WARNING: gsm8k: kept problems are NOT a prefix" in (paths["out"] / "c3" / "macros_c3.tex").read_text()
+    assert s["tasks"]["mbpp"]["prefix_check"]["ok"] is True
+
+
+def test_a_grid_configuration_with_no_records_is_refused_or_gives_n_zero(tmp_path):
+    paths = make_fixture(tmp_path, nshards=R_SHARDS, n_docs=R_DOCS)
+    key = config_key(cfg_of("Klass", 3, "gsm8k"))
+    for f in (paths["records"] / "sweep-gsm8k").glob("t12.shard*.jsonl"):
+        edit_rows(f, lambda rows: [r for r in rows if r["config"] != key])
+    with pytest.raises(SystemExit) as e:
+        run_main(paths)
+    assert "no records" in str(e.value)
+    assert run_main(paths, "--allow-partial") == 0
+    g = summary_of(paths)["tasks"]["gsm8k"]
+    assert (g["n"], g["n_complete"], g["n_planned"], g["n_dropped_problems"]) == (0, 0, R_DOCS, R_DOCS)
+    assert "$N=0$" in (paths["out"] / "t12" / "t12_matched_speed.tex").read_text()
+
+
+def test_score_rows_are_not_used_for_a_task_that_lost_problems(tmp_path):
+    """A score_t12 aggregate covers the dropped problems too, so with drops the accuracy is blank
+    (never an aggregate), even when its n happens to equal the kept number."""
+    paths = partial_fixture(tmp_path)
+    drop_verdicts(paths, C3A_KEY)
+    sc = tmp_path / "scores.json"
+    run = P.run_key(meta_of("gsm8k", 0))
+    sc.write_text(json.dumps({"rows": [{"task": "gsm8k", "config": C3A_KEY, "half": "report", "prompt_format": "chat",
+                                        "run": run, "n": KEPT_N, "n_correct": 7, "accuracy": 7 / KEPT_N,
+                                        "ci95": [0.4, 0.9]}]}))
+    assert run_main(paths, "--scores", str(sc), "--allow-partial") == 0
+    assert summary_of(paths)["tasks"]["gsm8k"]["decoders"]["CThreeA"]["speeds"]["2"].get("acc") is None
+
+
+
+# ----------------------------------------------------- off-operating-point marker (deviation 17 / PR #66)
+DAG = r"$^\dagger$"
+DAG_COMMENT = "% \\dagger: off the decoder's published operating point (caption explains)\n"
+
+
+def _matched_with(built, klass_slot, ref=2):
+    """The matched table of the fixture summary with KLASS matched at ``klass_slot`` in both tasks."""
+    S = json.loads(json.dumps(built["summary"]))
+    for task in P.TASKS:
+        S["tasks"][task]["matched"][str(ref)]["Klass"].update(
+            {"matched": True, "reason": None, "slot": klass_slot})
+    return S, P.matched_table(S)
+
+
+def test_the_off_operating_point_set_is_klass_slots_two_and_three():
+    assert P.OFF_OPERATING_POINT == {("Klass", 2), ("Klass", 3)}
+
+
+def test_matched_table_daggers_klass_at_slot_two_only_and_says_so_in_a_comment(built):
+    tex = (built["out"] / "t12" / "t12_matched_speed.tex").read_text()
+    assert built["summary"]["tasks"]["gsm8k"]["matched"]["2"]["Klass"]["slot"] == 2
+    labels = [l.split(" &")[0] for l in body_rows(tex)[2:]]
+    assert labels == [P.LABEL[d] + (DAG if d == "Klass" else "") for d in P.DECODERS]
+    assert tex.count(DAG) == 1                                     # no other decoder, no footnote row
+    assert tex.count(DAG_COMMENT) == 1
+    assert len(body_rows(tex)) == 2 + len(P.DECODERS)
+
+
+def test_matched_table_has_no_dagger_when_klass_is_shown_at_slot_one(built):
+    _, tex = _matched_with(built, 1)
+    assert "dagger" not in tex
+    assert any(l.startswith("KLASS &") for l in tex.splitlines())
+
+
+def test_the_dagger_follows_the_matched_slot_not_the_reference_slot(built):
+    # KLASS matched at slot 3 for the speed-2 reference: still off its operating point
+    assert DAG in _matched_with(built, 3)[1]
+    # another decoder matched at slot 3 gets no dagger
+    S = json.loads(json.dumps(built["summary"]))
+    for task in P.TASKS:
+        S["tasks"][task]["matched"]["2"]["TopK"]["slot"] = 3
+    tex = P.matched_table(S)
+    assert next(l for l in tex.splitlines() if l.startswith("Top-$k$")).split(" &")[0] == "Top-$k$"
+
+
+def test_summary_flags_klass_slots_two_and_three_only(built):
+    s = built["summary"]
+    assert s["off_operating_point_note"] == \
+        "KLASS slots 2-3: confidence threshold below its published range (deviation 17, PR #66)"
+    for task in P.TASKS:
+        for dec, d in s["tasks"][task]["decoders"].items():
+            for slot, st in d["speeds"].items():
+                assert st.get("off_operating_point", False) == (dec == "Klass" and slot in ("2", "3")), (dec, slot)
+        for per in s["tasks"][task]["matched"].values():
+            for dec, e in per.items():
+                if e["matched"]:
+                    assert e.get("off_operating_point", False) == (dec == "Klass" and e["slot"] in (2, 3))
+    for slot in ("2", "3"):
+        assert s["tasks"]["gsm8k"]["decoders"]["Klass"]["speeds"][slot]["off_operating_point"] is True
+    assert "off_operating_point" not in s["tasks"]["gsm8k"]["decoders"]["Klass"]["speeds"]["1"]
+
+
+def test_cost_table_and_zip_tables_mark_klass_slots_two_and_three(built):
+    tex = (built["out"] / "t12" / "t12_sanity_cost.tex").read_text()
+    klass = [l for l in tex.splitlines() if l.startswith("KLASS &")]
+    assert len(klass) == 2 and all(l.count(DAG) == 2 for l in klass)       # speeds 2 and 3, not 1
+    assert tex.count(DAG) == 5                                             # + one in the footnote
+    z = built["out"] / "t12" / "zip"
+    rows = list(csv.reader((z / "t12_sanity_cost.csv").read_text().splitlines()))
+    head, rows = rows[0], rows[1:]
+    for r in rows:
+        want = "true" if r[head.index("decoder")] == "Klass" and r[head.index("speed")] in ("2", "3") else "false"
+        assert r[head.index("off_operating_point")] == want, r
+    md = (z / "t12_sanity_cost.md").read_text(encoding="utf-8")
+    assert md.count("Klass †") == 4 and "| off_operating_point" not in md
+    rows = list(csv.reader((z / "t12_speed1_speed3.csv").read_text().splitlines()))
+    head, rows = rows[0], rows[1:]
+    assert [r[head.index("off_operating_point")] for r in rows if r[head.index("decoder")] == "Klass"] == \
+        ["false", "true", "false", "true"]
+    assert all(r[head.index("off_operating_point")] == "false" for r in rows if r[head.index("decoder")] != "Klass")
+    assert (z / "t12_speed1_speed3.md").read_text(encoding="utf-8").count("Klass †") == 2
+
+
+def test_the_marker_changes_nothing_else(built):
+    """Without the marker the matched table has the same rows, and no other summary entry gains a key."""
+    tex = (built["out"] / "t12" / "t12_matched_speed.tex").read_text()
+    plain = tex.replace(DAG, "").replace(DAG_COMMENT, "")
+    assert len(body_rows(plain)) == 2 + len(P.DECODERS)
+    assert [l.split(" &")[0] for l in body_rows(plain)[2:]] == [P.LABEL[d] for d in P.DECODERS]
+    s = built["summary"]
+    flagged = {(t, d, sl) for t in P.TASKS for d, v in s["tasks"][t]["decoders"].items()
+               for sl, st in v["speeds"].items() if "off_operating_point" in st}
+    assert flagged == {(t, "Klass", sl) for t in P.TASKS for sl in ("2", "3") if sl in
+                       s["tasks"][t]["decoders"]["Klass"]["speeds"]}
+
+
+# ----------------------------------------------------- KLASS's daggered difference cells are not quoted (team decision)
+def klass_row(tex):
+    return next(l for l in tex.splitlines() if l.startswith("KLASS"))
+
+
+def test_daggered_difference_cells_print_a_dash_but_keep_tok_step_accuracy_and_the_dagger(built):
+    tex = (built["out"] / "t12" / "t12_matched_speed.tex").read_text()
+    row = klass_row(tex)
+    cells = [c.strip() for c in row.rstrip(" \\").split(" & ")]
+    assert cells[0] == "KLASS" + DAG and len(cells) == 7
+    t = built["summary"]["tasks"]
+    for i, task in enumerate(P.TASKS):
+        tps, acc, diff = cells[1 + 3 * i: 4 + 3 * i]
+        e = t[task]["matched"]["2"]["Klass"]
+        assert e["slot"] == 2 and e["diff"] is not None            # there is a difference, it is just not printed
+        assert diff == P.DASH == "---"
+        assert tps == P.num(e["tps"], 2) and "scriptsize" in acc and acc != P.DASH
+    # nobody else's difference cell is a dash on account of this
+    for name in ("Top-$k$", "Margin", "PC-Sampler"):
+        r = next(l for l in tex.splitlines() if l.startswith(name))
+        assert "---" not in r, name
+
+
+def test_a_klass_row_at_slot_one_keeps_its_difference(built):
+    _, tex = _matched_with(built, 1)
+    cells = [c.strip() for c in klass_row(tex).rstrip(" \\").split(" & ")]
+    assert "---" not in cells and "scriptsize" in cells[3] and "scriptsize" in cells[6]
+
+
+@pytest.mark.parametrize("slot", [2, 3])
+def test_the_dash_follows_the_matched_slot(built, slot):
+    S, tex = _matched_with(built, slot)
+    cells = [c.strip() for c in klass_row(tex).rstrip(" \\").split(" & ")]
+    assert cells[3] == cells[6] == "---"
+
+
+def test_the_summary_and_macros_keep_the_daggered_difference_and_flag_it(built):
+    s, mac = built["summary"], built["macros"]
+    for task in P.TASKS:
+        for slot, per in s["tasks"][task]["matched"].items():
+            for dec, e in per.items():
+                flagged = bool(e["matched"] and dec == "Klass" and e["slot"] in (2, 3))
+                assert e.get("diff_not_quoted", False) == flagged, (task, slot, dec)
+                if flagged:
+                    assert e["diff"] is not None and e["lo"] is not None and e["hi"] is not None
+    # the number is still in the code archive's macros
+    w = "Gsm"
+    assert val(mac[f"CThreeTTwelve{w}MatchedDiffKlassSpeedTwo"]) == pytest.approx(
+        s["tasks"]["gsm8k"]["matched"]["2"]["Klass"]["diff"], abs=5e-4)
+    assert mac[f"CThreeTTwelve{w}MatchedDiffKlassSpeedTwo"] != DASH_MACRO
+
+
+def test_zip_markdown_does_not_quote_a_daggered_matched_difference_but_the_csv_keeps_it(built, tmp_path):
+    S = json.loads(json.dumps(built["summary"]))
+    for task in P.TASKS:                       # KLASS matched at slot 2 for the speed-1 reference
+        S["tasks"][task]["matched"]["1"]["Klass"].update(
+            {"matched": True, "reason": None, "slot": 2, "tps": 3.0, "diff": 0.123, "lo": 0.05, "hi": 0.2,
+             "n_paired": 30})
+    P.write_zip_tables(S, tmp_path)
+    md = (tmp_path / "t12_speed1_speed3.md").read_text(encoding="utf-8")
+    assert "not quoted" in md
+    row = next(l for l in md.splitlines() if l.startswith("| gsm8k | Klass") and "| 1 |" in l)
+    assert "0.123" not in row and "0.050" not in row and "0.200" not in row and "| 2 † |" in row   # slot 2 shown
+    rows = list(csv.reader((tmp_path / "t12_speed1_speed3.csv").read_text().splitlines()))
+    head = rows[0]
+    k = next(r for r in rows[1:] if r[head.index("task")] == "gsm8k" and r[head.index("decoder")] == "Klass"
+             and r[head.index("speed")] == "1")
+    assert k[head.index("matched_diff")] == "0.123" and k[head.index("matched_off_operating_point")] == "true"
+
+
+def test_the_committed_zip_markdown_is_unchanged_when_no_daggered_row_is_matched(built):
+    md = (built["out"] / "t12" / "zip" / "t12_speed1_speed3.md").read_text(encoding="utf-8")
+    assert "not quoted" not in md
+
+
+# ------------------------------------------------------------------ sensitivity mode (deviation 17, PR #74)
+SENS = ("--allow-mixed-machines", "--tag", "mbpp-250")
+
+
+def sens_dir(paths, tag="mbpp-250"):
+    return paths["out"] / "t12" / "sensitivity" / tag
+
+
+def sens_summary(paths, tag="mbpp-250"):
+    return json.loads((sens_dir(paths, tag) / "llada-8b-instruct_fp16_t12-summary.json").read_text())
+
+
+def split_machines(paths, task="gsm8k", new_revision=None):
+    """Shard 1 of ``task`` as if a second machine ran it: its own directory, host, gpu and label (and
+    optionally a different run hash, whose verdicts are rewritten to carry it)."""
+    src = paths["records"] / f"sweep-{task}"
+    dst = paths["records"] / f"h200-b-{task}"
+    dst.mkdir()
+    for f in list(src.glob("t12.shard1of2*")):
+        f.rename(dst / f.name)
+    mp = dst / "t12.shard1of2.meta.json"
+    m = json.loads(mp.read_text())
+    m["provenance"] = {**m["provenance"], "host": "jarvis-2", "gpu": "H200"}
+    m["label"] = "jl-report-b"
+    if new_revision:
+        m["model_revision"] = new_revision
+        key = P.run_key(m)
+        vs = [json.loads(l) for l in paths["verdicts"].read_text().splitlines()]
+        write_jsonl(paths["verdicts"], [dict(v, run=key) if v["task"] == task and v["doc_id"] % 2 == 1 else v
+                                        for v in vs])
+    mp.write_text(json.dumps(m))
+
+
+def test_the_sensitivity_flag_needs_a_tag(tmp_path):
+    paths = make_fixture(tmp_path)
+    with pytest.raises(SystemExit) as e:
+        run_main(paths, "--allow-mixed-machines")
+    assert e.value.code != 0
+    assert not (paths["out"] / "t12").exists() and not (paths["out"] / "c3").exists()     # nothing written
+
+
+@pytest.mark.parametrize("tag", ["Bad_Tag", "a/b", "..", "has space", ""])
+def test_a_malformed_tag_is_refused(tmp_path, tag):
+    paths = make_fixture(tmp_path)
+    with pytest.raises(SystemExit) as e:
+        run_main(paths, "--allow-mixed-machines", "--tag", tag)
+    assert e.value.code != 0
+    assert not paths["out"].exists()
+
+
+def test_a_tag_without_the_flag_is_refused(tmp_path):
+    paths = make_fixture(tmp_path)
+    with pytest.raises(SystemExit) as e:
+        run_main(paths, "--tag", "x")
+    assert e.value.code != 0
+    assert not paths["out"].exists()
+
+
+@pytest.mark.parametrize("new_revision", [None, "rev-b"])
+def test_mixed_machines_are_refused_without_the_flag_and_pass_with_it(tmp_path, new_revision):
+    paths = make_fixture(tmp_path)
+    split_machines(paths, "gsm8k", new_revision)
+    with pytest.raises(SystemExit) as e:
+        run_main(paths)
+    msg = str(e.value)
+    assert "gsm8k" in msg and "host" in msg and "deviations.md 17" in msg
+    assert not paths["out"].exists()                                  # the refusal wrote nothing
+    assert run_main(paths, *SENS) == 0
+    s = sens_summary(paths)
+    mixed = {d["field"]: d["values"] for d in s["mixed_machines"]["gsm8k"]}
+    assert mixed["host"] == ["jarvis-1", "jarvis-2"] and mixed["gpu"] == ["H200", "RTX PRO 6000"]
+    assert mixed["label"] == ["jl-report", "jl-report-b"] and "output directory" in mixed
+    assert ("run hash" in mixed) == bool(new_revision)
+    assert "mbpp" not in s["mixed_machines"]                          # only the task that is mixed
+    assert any("MIXED MACHINES" in w and "gsm8k" in w for w in s["warnings"])
+
+
+def rounded(o, nd=9):
+    """Floats to ``nd`` places: a sum over shards in another order differs in the last digit."""
+    if isinstance(o, float):
+        return round(o, nd)
+    if isinstance(o, dict):
+        return {k: rounded(v, nd) for k, v in o.items()}
+    if isinstance(o, list):
+        return [rounded(v, nd) for v in o]
+    return o
+
+
+@pytest.mark.parametrize("new_revision", [None, "rev-b"])
+def test_merged_records_give_the_same_numbers_as_one_machine(tmp_path, built, new_revision):
+    paths = make_fixture(tmp_path)
+    split_machines(paths, "gsm8k", new_revision)
+    assert run_main(paths, *SENS) == 0
+    got = sens_summary(paths)["tasks"]["gsm8k"]
+    want = built["summary"]["tasks"]["gsm8k"]
+    assert got["n"] == want["n"] == N_DOCS
+    assert rounded(got["decoders"]) == rounded(want["decoders"]) and rounded(got["matched"]) == rounded(want["matched"])
+
+
+def test_every_sensitivity_output_is_under_the_sensitivity_dir(tmp_path):
+    paths = make_fixture(tmp_path)
+    split_machines(paths)
+    assert run_main(paths, *SENS) == 0
+    sd = sens_dir(paths)
+    written = {p.relative_to(paths["out"]).as_posix() for p in paths["out"].rglob("*") if p.is_file()}
+    assert written and all(w.startswith("t12/sensitivity/mbpp-250/") for w in written), sorted(written)
+    inside = {p.relative_to(sd).as_posix() for p in sd.rglob("*") if p.is_file()}
+    assert {"macros_c3_sensitivity.tex", "t12_matched_speed.tex", "t12_sanity_cost.tex",
+            "llada-8b-instruct_fp16_t12-summary.json", "figures/t12_matched_speed.pdf",
+            "figures/t12_matched_speed.png", "zip/t12_sanity.csv", "zip/t12_sanity_cost.csv",
+            "zip/t12_sanity_cost.md", "zip/t12_speed1_speed3.csv", "zip/t12_speed1_speed3.md"} <= inside
+    for name in ("macros_c3.tex",):
+        assert not (paths["out"] / "c3" / name).exists()
+    assert not (paths["out"] / "t12" / "t12_matched_speed.tex").exists()
+    s = sens_summary(paths)
+    assert all(Path(o).resolve().is_relative_to(sd.resolve()) for o in s["outputs"])
+    assert len(s["outputs"]) == 5
+
+
+def test_sensitivity_macros_use_the_sens_prefix_and_say_not_for_the_paper(tmp_path, built):
+    paths = make_fixture(tmp_path)
+    split_machines(paths)
+    assert run_main(paths, *SENS) == 0
+    text = (sens_dir(paths) / "macros_c3_sensitivity.tex").read_text(encoding="utf-8")
+    head = [l for l in text.splitlines() if l.startswith("%")][:3]
+    assert "SENSITIVITY" in head[0] and "deviation 17" in head[0] and "PR #74" in head[0] \
+        and "NOT FOR THE PAPER" in head[0]
+    macros = parse_macros(text)
+    assert macros and all(n.startswith(("CThreeTTwelveSens", "CThreeTElevenSens")) for n in macros), \
+        [n for n in macros if not n.startswith(("CThreeTTwelveSens", "CThreeTElevenSens"))]
+    assert not [n for n in macros if n.startswith("CThreeTTwelve") and not n.startswith("CThreeTTwelveSens")]
+    assert not set(macros) & set(built["macros"])                      # an \input could never redefine the paper's
+    # one-to-one with the paper's macros, renamed
+    renamed = {n.replace("CThreeTTwelve", "CThreeTTwelveSens", 1).replace("CThreeTEleven", "CThreeTElevenSens", 1): v
+               for n, v in built["macros"].items()}
+    assert macros == renamed
+    assert text.count("\\newcommand") == len(macros)
+    for tex in ("t12_matched_speed.tex", "t12_sanity_cost.tex"):
+        assert "NOT FOR THE PAPER" in (sens_dir(paths) / tex).read_text(encoding="utf-8").splitlines()[0]
+
+
+def test_an_out_dir_that_would_hit_the_normal_outputs_is_refused(tmp_path):
+    paths = make_fixture(tmp_path)
+    split_machines(paths)
+    # the sensitivity dir is a link to the normal t12 directory: its outputs would overwrite the paper's
+    normal_t12 = paths["out"] / "t12"
+    normal_t12.mkdir(parents=True)
+    (paths["out"] / "t12" / "sensitivity").mkdir()
+    try:
+        (normal_t12 / "sensitivity" / "mbpp-250").symlink_to(normal_t12, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks not available")
+    with pytest.raises(SystemExit) as e:
+        run_main(paths, *SENS)
+    assert "refusing a sensitivity run" in str(e.value) and "paper outputs" in str(e.value)
+    assert not list(normal_t12.glob("t12_matched_speed.tex")) and not (paths["out"] / "c3").exists()
+
+
+def test_the_output_path_guard(tmp_path):
+    sd = tmp_path / "out" / "t12" / "sensitivity" / "x"
+    ok = P.planned_outputs(sd, sd, "macros_c3_sensitivity.tex")
+    normal = P.planned_outputs(tmp_path / "out" / "c3", tmp_path / "out" / "t12")
+    P.check_sensitivity_outputs(ok, sd, normal)                          # all inside: fine
+    for bad in (tmp_path / "out" / "c3" / "macros_c3.tex",               # the paper's macros
+                tmp_path / "out" / "t12" / "t12_matched_speed.tex",     # the paper's table
+                sd.parent / "elsewhere.tex",                             # a sibling of the sensitivity dir
+                sd / ".." / ".." / "t12_sanity_cost.tex"):               # ..-escape
+        with pytest.raises(SystemExit) as e:
+            P.check_sensitivity_outputs(ok + [bad], sd, normal)
+        assert "refusing a sensitivity run" in str(e.value)
+    # the paper's files in the repo, whatever the out-dir
+    with pytest.raises(SystemExit):
+        P.check_sensitivity_outputs([ROOT / "artifacts" / "c3" / "macros_c3.tex"], sd,
+                                    P.planned_outputs(ROOT / "artifacts" / "c3", ROOT / "artifacts" / "t12"))
+
+
+def test_the_summary_carries_the_sensitivity_flags_and_the_normal_one_does_not(tmp_path, built):
+    paths = make_fixture(tmp_path)
+    split_machines(paths)
+    assert run_main(paths, *SENS) == 0
+    s = sens_summary(paths)
+    assert s["sensitivity"] is True and s["sensitivity_tag"] == "mbpp-250" and s["allow_mixed_machines"] is True
+    assert isinstance(s["mixed_machines"], dict) and s["mixed_machines"]["gsm8k"]
+    assert "NOT FOR THE PAPER" in s["sensitivity_note"]
+    for k in ("sensitivity", "sensitivity_tag", "mixed_machines", "allow_mixed_machines"):
+        assert k not in built["summary"]
+    assert all(n.startswith(("CThreeTTwelveSens", "CThreeTElevenSens")) for n in s["macro_names"])
+
+
+def test_a_sensitivity_run_of_one_machine_has_no_mixed_machines(tmp_path):
+    paths = make_fixture(tmp_path)
+    assert run_main(paths, *SENS) == 0
+    s = sens_summary(paths)
+    assert s["sensitivity"] is True and s["mixed_machines"] == {}
+
+
+def test_the_other_guards_stay_on_in_sensitivity_mode(tmp_path):
+    # fit-half doc ids
+    paths = make_fixture(tmp_path / "fit")
+    edit_rows(paths["records"] / "sweep-gsm8k" / "t12.shard0of2.jsonl", lambda rows: rows + [dict(rows[0], doc_id=JUNK_DOC)])
+    with pytest.raises(SystemExit) as e:
+        run_main(paths, *SENS)
+    assert "fit" in str(e.value)
+    # precision
+    paths = make_fixture(tmp_path / "prec")
+    split_machines(paths)
+    mp = paths["records"] / "h200-b-gsm8k" / "t12.shard1of2.meta.json"
+    mp.write_text(json.dumps(json.loads(mp.read_text()) | {"precision": "bf16"}))
+    with pytest.raises(SystemExit) as e:
+        run_main(paths, *SENS)
+    assert "fp16" in str(e.value)
+    # chat prompt
+    paths = make_fixture(tmp_path / "chat")
+    split_machines(paths)
+    mp = paths["records"] / "h200-b-gsm8k" / "t12.shard1of2.meta.json"
+    mp.write_text(json.dumps(json.loads(mp.read_text()) | {"prompt": {"format": "lmeval", "fewshot": 5}}))
+    with pytest.raises(SystemExit) as e:
+        run_main(paths, *SENS)
+    assert "chat" in str(e.value)
+    # the same (config, doc) in two shard files, one per machine: never merged
+    paths = make_fixture(tmp_path / "dup")
+    src = paths["records"] / "sweep-gsm8k"
+    dst = paths["records"] / "h200-b-gsm8k"
+    dst.mkdir()
+    for f in src.glob("t12.shard0of2*"):
+        (dst / f.name).write_text(f.read_text())
+    mp = dst / "t12.shard0of2.meta.json"
+    m = json.loads(mp.read_text())
+    m["provenance"] = {**m["provenance"], "host": "jarvis-2"}
+    mp.write_text(json.dumps(m))
+    with pytest.raises(SystemExit) as e:
+        run_main(paths, *SENS)
+    assert "two shard files" in str(e.value)
+
+
+def test_the_completeness_filter_stays_on_in_sensitivity_mode(tmp_path):
+    paths = make_fixture(tmp_path)
+    split_machines(paths)
+    for f in paths["records"].rglob("t12.shard*.jsonl"):               # both machines' shards of gsm8k stop at doc 19
+        if f.parent.name.endswith("gsm8k"):
+            edit_rows(f, lambda rows: [r for r in rows if r["doc_id"] < 20])
+    with pytest.raises(SystemExit) as e:                                  # a short run is still refused ...
+        run_main(paths, *SENS)
+    assert "partial" in str(e.value)
+    assert run_main(paths, *SENS, "--allow-partial") == 0                 # ... and filtered to complete problems
+    t = sens_summary(paths)["tasks"]["gsm8k"]
+    assert t["n"] == t["n_complete"] == 20 and t["n_planned"] == N_DOCS and t["partial"] is True
